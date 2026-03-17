@@ -1,6 +1,6 @@
 {
   "name": "@alicloud/openclaw-security-assistant",
-  "version": "2026.3.17",
+  "version": "1.0.0",
   "description": "Security assistant plugin by Alibaba Cloud that provides LLM request/response protection, tool call security checks.",
   "type": "module",
   "license": "Apache-2.0",
@@ -13,7 +13,8 @@
     "security"
   ],
   "scripts": {
-    "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=bundle.js"
+    "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=bundle.js",
+    "prepublishOnly": "npm run build"
   },
   "files": [
     "README.md",
