@@ -1,0 +1,27 @@
+{
+  "id": "openclaw-security-assistant",
+  "name": "openclaw-security-assistant Plugin",
+  "description": "Security assistant plugin by Alibaba Cloud that provides LLM request/response protection, tool call security checks.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "endpointAddr": {
+        "type": "string",
+        "description": "Base URL for agent management&security servers"
+      },
+      "protectServerAddr": {
+        "type": "string",
+        "description": "Base URL for security protection server (overrides endpointAddr)"
+      },
+      "managementServerAddr": {
+        "type": "string",
+        "description": "Base URL for management server (overrides endpointAddr)"
+      },
+      "debug": {
+        "type": "boolean",
+        "description": "Enable debug mode for detailed logging (default: false)"
+      }
+    }
+  }
+}
