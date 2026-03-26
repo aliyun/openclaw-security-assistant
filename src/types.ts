@@ -3,7 +3,7 @@
  */
 
 /** 安全检查处置动作 */
-export type SecurityAction = "pass" | "block" | "hint";
+export type SecurityAction = "allow" | "block" | "hint";
 
 /** 请求类型枚举 */
 export type ReqType = "llm" | "tool_call";

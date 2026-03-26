@@ -135,12 +135,12 @@ export async function callRemoteSecurityCheck(
     // 认证服务未就绪时，直接放行
     if (!isAuthServiceReady()) {
         logWarn("check", "skip", { reason: "auth service not ready, fail-open pass" });
-        return { request_id: "", action: "pass" };
+        return { request_id: "", action: "allow" };
     }
 
     const f = originalFetch ?? globalThis.fetch;
     if (!f) {
-        return { request_id: "", action: "pass" };
+        return { request_id: "", action: "allow" };
     }
 
     const requestId = randomUUID();
@@ -153,7 +153,7 @@ export async function callRemoteSecurityCheck(
     const t = setTimeout(() => controller.abort(), timeout);
 
     try {
-        logDebug("check", "request", { url, requestId, direction });
+        logDebug("check", "request", { requestId, direction, url });
 
         const resp = await f(url, {
             method: "POST",
@@ -163,7 +163,7 @@ export async function callRemoteSecurityCheck(
         });
 
         const json = (await resp.json()) as SecurityCheckResponse;
-        logDebug("check", "response", { requestId, action: json.action });
+        logDebug("check", "response", { requestId, direction, action: json.action, content: json.content });
 
         // 检测 token 超时错误码（402）
         if (json.error?.code === "402") {
@@ -178,7 +178,7 @@ export async function callRemoteSecurityCheck(
     } catch (e) {
         // 远程服务不可用/超时/JSON 异常：降级放行
         logWarn("check", "error", { requestId, error: String(e) });
-        return { request_id: requestId, action: "pass" };
+        return { request_id: requestId, action: "allow" };
     } finally {
         clearTimeout(t);
     }
@@ -210,11 +210,11 @@ export async function checkLlmRequest(
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, LLM_CHECK_PATH, "req", originalFetch, undefined, logger);
 
     if (result.error) {
-        // 错误时降级放行
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }
 
 /**
@@ -242,11 +242,11 @@ export async function checkLlmResponse(
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, LLM_CHECK_PATH, "resp", originalFetch, undefined, logger);
 
     if (result.error) {
-        // 错误时降级放行
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }
 
 /**
@@ -273,10 +273,11 @@ export async function checkToolCallRequest(
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, TOOL_CHECK_PATH, "req", originalFetch, undefined, logger);
 
     if (result.error) {
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }
 
 /**
@@ -305,8 +306,9 @@ export async function checkToolCallResponse(
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, TOOL_CHECK_PATH, "resp", originalFetch, undefined, logger);
 
     if (result.error) {
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }

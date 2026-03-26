@@ -293,14 +293,14 @@ function collectSkills(logger?: PluginLogger): SkillInfo[] {
 
         const output = result.stdout?.trim();
         if (!output) {
-            logWarn("skills", "empty_output", {});
+            logDebug("skills", "empty_output", {});
             return [];
         }
 
         // 从输出中提取 JSON 部分（跳过日志前缀）
         const jsonOutput = extractJsonFromOutput(output);
         if (!jsonOutput) {
-            logWarn("skills", "no_json", {});
+            logDebug("skills", "no_json", {});
             return [];
         }
 
@@ -492,14 +492,14 @@ function collectAllPluginTools(logger?: PluginLogger): ToolInfo[] {
 
         const output = result.stdout?.trim();
         if (!output) {
-            logWarn("tools", "empty_output", {});
+            logDebug("tools", "empty_output", {});
             return [];
         }
 
         // 从输出中提取 JSON 部分（跳过日志前缀）
         const jsonOutput = extractJsonFromOutput(output);
         if (!jsonOutput) {
-            logWarn("tools", "no_json", {});
+            logDebug("tools", "no_json", {});
             return [];
         }
 
@@ -578,14 +578,14 @@ function collectEnabledLoadedPluginToolIds(logger?: PluginLogger): string[] {
 
         const output = result.stdout?.trim();
         if (!output) {
-            logWarn("tools", "empty_output", {});
+            logDebug("tools", "empty_output", {});
             return [];
         }
 
         // 从输出中提取 JSON 部分（跳过日志前缀）
         const jsonOutput = extractJsonFromOutput(output);
         if (!jsonOutput) {
-            logWarn("tools", "no_json", {});
+            logDebug("tools", "no_json", {});
             return [];
         }
 
@@ -785,8 +785,7 @@ export function createAssetReportService(params: {
                 return;
             }
 
-            // 关键日志：上报成功
-            logInfo("asset_report", "success", {});
+            logDebug("asset_report", "success", {});
 
         } catch (e: any) {
             logWarn("asset_report", "error", { error: String(e?.message || e) });
@@ -821,7 +820,7 @@ export function createAssetReportService(params: {
             timer = setInterval(() => reportOnce(ctx.logger).catch(() => {}), intervalMs);
             timer.unref?.();
 
-            logInfo("asset_report", "started", { intervalMs, timeoutMs });
+            logDebug("asset_report", "started", { intervalMs, timeoutMs });
         },
         stop: async () => {
             if (timer) clearInterval(timer);

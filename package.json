@@ -1,6 +1,6 @@
 {
   "name": "@alicloud/openclaw-security-assistant",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Security assistant plugin by Alibaba Cloud that provides LLM request/response protection, tool call security checks.",
   "type": "module",
   "license": "Apache-2.0",

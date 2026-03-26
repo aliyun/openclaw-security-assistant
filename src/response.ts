@@ -261,8 +261,8 @@ export function createSecurityResponse(
         originalBody?: string;
     },
 ): Response | null {
-    // pass: 不需要修改响应
-    if (action === "pass") {
+    // allow: 不需要修改响应
+    if (action === "allow") {
         return null;
     }
 
