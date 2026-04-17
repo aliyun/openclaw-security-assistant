@@ -35,6 +35,8 @@ import {
     logError,
     logDebug,
 } from "./src/logger.js";
+import { SkillScanScheduler } from "./src/skill-scanner/skill-scan-scheduler.js";
+import { createSkillMdGuard } from "./src/skill-guard/skill-md-guard.js";
 
 // Body preview truncation limit for debug logs
 const BODY_PREVIEW_MAX_LENGTH = 500;
@@ -43,6 +45,11 @@ const BODY_PREVIEW_MAX_LENGTH = 500;
 const FETCH_WRAPPED_KEY = Symbol.for('openclaw-security-assistant.fetch-wrapped');
 // 缓存插件加载前的原始 fetch，确保所有内部调用（service、hook）都使用未被包装的 fetch
 const ORIGINAL_FETCH_KEY = Symbol.for('openclaw-security-assistant.original-fetch');
+
+// 模块级持久变量：跨 register() 调用保持存活，避免 gateway restart 触发的
+// 重新注册导致 hook 闭包引用新的 null 变量而 service.start() 尚未被框架调度
+let skillScanScheduler: SkillScanScheduler | null = null;
+let skillMdGuard: ReturnType<typeof createSkillMdGuard> | null = null;
 
 const plugin = {
     id: "openclaw-security-assistant",
@@ -107,9 +114,40 @@ const plugin = {
                 originalFetch,
                 protectServerAddr,
                 intervalMs: 600_000, // 10min上传一次
-                timeoutMs: 60_000, // 超时1min
+                timeoutMs: 30_000, // 超时30s
             }),
         );
+
+        // 2) 注册 Skill 安全扫描调度器：定时扫描 skill 变更，上报待检测文件
+        api.registerService({
+            id: "skill-scan-scheduler",
+            start(ctx) {
+                skillScanScheduler = new SkillScanScheduler({
+                    stateDir: ctx.stateDir,
+                    fetch: originalFetch,
+                    apiBaseUrl: protectServerAddr,
+                    openclawConfig: ctx.config,
+                });
+                skillScanScheduler.start();
+
+                // 创建 Guard（依赖 Scheduler 的 fingerprintStore）
+                skillMdGuard = createSkillMdGuard({
+                    fingerprintStore: skillScanScheduler.fingerprintStore,
+                    protectServerAddr,
+                    originalFetch,
+                });
+
+                logDebug("init", "skill_scan_scheduler_started", {
+                    stateDir: ctx.stateDir,
+                    apiBaseUrl: protectServerAddr,
+                });
+            },
+            stop() {
+                skillScanScheduler?.stop();
+                skillScanScheduler = null;
+                skillMdGuard = null;
+            },
+        });
 
         // 检查 fetch 是否已被包装 - 防止重复加载
         const alreadyWrapped = (globalThis as any)[FETCH_WRAPPED_KEY];
@@ -400,7 +438,33 @@ const plugin = {
         });
 
         api.on("before_tool_call", async (event, ctx) => {
-            // Tool Call 请求安全检测
+            logDebug("tool_call", "before_tool_call", {
+                toolName: event.toolName,
+                params: event.params,
+                hasGuard: !!skillMdGuard,
+            });
+
+            // 1. Skill 运行时安全检测（本地 + APS 查询，优先级高）
+            if (skillMdGuard && event.toolName === "read") {
+                try {
+                    const filePath = typeof event.params?.path === "string" ? event.params.path : undefined;
+                    if (filePath) {
+                        const guardResult = await skillMdGuard.handleSkillMdRead(filePath);
+                        if (guardResult?.block) {
+                            logInfo("skill_guard", "skill_blocked", { toolName: event.toolName, path: filePath });
+                            return { block: true, blockReason: guardResult.blockReason };
+                        }
+                    }
+                } catch (e: unknown) {
+                    logWarn("skill_guard", "guard_error", {
+                        toolName: event.toolName,
+                        error: String(e instanceof Error ? e.message : e),
+                    });
+                    // 异常时降级放行
+                }
+            }
+
+            // 2. 通用 Tool Call 安全检测（远端 API，保持已有逻辑不变）
             try {
                 const result = await checkToolCallRequest(
                     {
@@ -411,7 +475,11 @@ const plugin = {
                     originalFetch,
                 );
 
-                logDebug("tool_call", "request_check", {toolName: event.toolName, action: result.action});
+                logDebug("tool_call", "request_check", {
+                    toolName: event.toolName,
+                    action: result.action,
+                    params: event.params,
+                });
 
                 if (result.action === "block") {
                     const blockReason = result.content ?? "Tool call blocked by security policy";

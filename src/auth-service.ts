@@ -8,7 +8,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { OpenClawPluginApi, OpenClawPluginService, PluginLogger } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk";
+import type { OpenClawPluginService, OpenClawPluginServiceContext } from "openclaw/plugin-sdk/core";
 import { SDK_VERSION } from "./config.js";
 import { getAgentRuntime, getRuntimeContext, setAgentId } from "./runtime.js";
 import { buildUrl } from "./utils.js";
@@ -714,7 +715,7 @@ export function createAuthService(params: {
 
     return {
         id: "openclaw-security-assistant-auth",
-        start: async (ctx) => {
+        start: async (ctx: OpenClawPluginServiceContext) => {
             const logger = ctx.logger;
             const runtimeCtx = getRuntimeContext();
 

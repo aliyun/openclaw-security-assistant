@@ -6,6 +6,7 @@
 
 - **LLM Request/Response Inspection**: Automatically intercepts requests to and responses from LLMs for security auditing
 - **Tool Call Security Audit**: Performs security checks before and after tool execution to prevent malicious calls and sensitive data leakage
+- **Skill Security Detection**: Periodically scans Skill file changes for security inspection, and blocks loading of Skills with security risks at runtime
 - **Global Fetch Interception**: Transparently intercepts underlying model calls via `global.fetch` hooking
 - **Intelligent Fail-Open**: Automatically allows requests through when the security service is unavailable (fail-open), ensuring business continuity
 
@@ -58,3 +59,10 @@ plugins:
 | Pre-execution | `block` | Call request blocked; returns a security notice |
 | Post-execution | `allow` | Call result inspection passed; returns normally |
 | Post-execution | `block` | Call result blocked; returns a security notice |
+
+### Skill Security Detection
+
+| Phase | Action | Description |
+|-------|--------|-------------|
+| Skill loading | `allow` | Skill passed security detection, loading proceeds normally |
+| Skill loading | `block` | Skill has security risks, loading is blocked |

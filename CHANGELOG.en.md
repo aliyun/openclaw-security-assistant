@@ -4,6 +4,14 @@ This file documents all notable changes to the `@alicloud/openclaw-security-assi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v1.2.0] - 2026-04-16
+
+### Added
+1. Added Skill security detection: periodically scans Skill file changes and submits them to the security service for inspection, blocks loading of Skills with security risks at runtime
+
+### Changed
+1. Improved Agent asset scanning and reporting performance, faster plugin loading during Gateway restart
+
 ## [v1.1.0] - 2026-03-26
 
 ### Changed
@@ -23,3 +31,4 @@ Initial v1.0.0 release with LLM and Tool Call request/response inspection and en
 <!-- Version links -->
 [v1.0.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.0.0
 [v1.1.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.1.0
+[v1.2.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.2.0
