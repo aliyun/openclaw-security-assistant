@@ -6,8 +6,13 @@
 
 - **LLM Request/Response Inspection**: Automatically intercepts requests to and responses from LLMs for security auditing
 - **Tool Call Security Audit**: Performs security checks before and after tool execution to prevent malicious calls and sensitive data leakage
+- **Skill Security Detection**: Periodically scans Skill file changes for security inspection, and blocks loading of Skills with security risks at runtime
 - **Global Fetch Interception**: Transparently intercepts underlying model calls via `global.fetch` hooking
 - **Intelligent Fail-Open**: Automatically allows requests through when the security service is unavailable (fail-open), ensuring business continuity
+
+## Compatibility
+
+Requires OpenClaw version >= `2026.2.26`.
 
 ## Quick Start
 
@@ -35,20 +40,29 @@ plugins:
 
 ## Security Policy
 
-For LLM requests, the following actions are supported:
-- **pass**: Request allowed, normal flow continues
-- **block**: Request blocked with a security notice; risky requests will not be forwarded to the model
-- **hint**: Request flagged with notice but not blocked
+### LLM
 
-For LLM responses, the following actions are supported:
-- **pass**: Response allowed, normal flow continues
-- **block**: Response blocked, returns security notice
-- **hint**: Response flagged with notice but not blocked
+| Phase | Action | Description |
+|-------|--------|-------------|
+| Request | `allow` | Request allowed, normal flow continues |
+| Request | `block` | Request blocked with a security notice; risky requests will not be forwarded to the model |
+| Request | `hint` | Request flagged with notice but not blocked |
+| Response | `allow` | Response allowed, normal flow continues |
+| Response | `block` | Response blocked, returns security notice |
+| Response | `hint` | Response flagged with notice but not blocked |
 
-For Tool Calls before execution, the following actions are supported:
-- **pass**: Call request allowed; proceeds with normal execution
-- **block**: Call request blocked; returns a security notice
+### Tool Call
 
-For Tool Calls after execution, the following actions are supported:
-- **pass**: Call result inspection passed; returns normally
-- **block**: Call result blocked; returns a security notice
+| Phase | Action | Description |
+|-------|--------|-------------|
+| Pre-execution | `allow` | Call request allowed; proceeds with normal execution |
+| Pre-execution | `block` | Call request blocked; returns a security notice |
+| Post-execution | `allow` | Call result inspection passed; returns normally |
+| Post-execution | `block` | Call result blocked; returns a security notice |
+
+### Skill Security Detection
+
+| Phase | Action | Description |
+|-------|--------|-------------|
+| Skill loading | `allow` | Skill passed security detection, loading proceeds normally |
+| Skill loading | `block` | Skill has security risks, loading is blocked |

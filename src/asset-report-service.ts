@@ -6,16 +6,16 @@
 
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
-import type { OpenClawPluginApi, OpenClawPluginService, PluginLogger } from "openclaw/plugin-sdk";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginService, OpenClawPluginServiceContext } from "openclaw/plugin-sdk/core";
 import { SDK_VERSION } from "./config.js";
-import { getAccessToken, isAuthServiceReady } from "./auth-service.js";
+import { isAuthServiceReady } from "./auth-service.js";
 import { getRuntimeContext } from "./runtime.js";
-import { buildUrl } from "./utils.js";
+import { buildUrl, buildApsHeaders } from "./utils.js";
 import {
-    logInfo,
     logWarn,
-    logError,
     logDebug,
 } from "./logger.js";
 import type {
@@ -29,8 +29,16 @@ import type {
     ToolInfo,
 } from "./types.js";
 
+const execFileAsync = promisify(execFile);
+
 /** 资产上报路径 */
 const ASSET_REPORT_PATH = "/v1/agent/heartbeat";
+
+/** CLI 数据缓存默认刷新间隔（毫秒）：10 分钟 */
+const CLI_CACHE_REFRESH_INTERVAL_MS = 10 * 60_000;
+
+/** 缓存最大可接受年龄（毫秒）：30 分钟，超过则告警 */
+const MAX_CACHE_AGE_MS = 30 * 60_000;
 
 // ============================================================================
 // Data Collection Helpers
@@ -259,48 +267,33 @@ type SkillsListJsonOutput = {
 };
 
 /**
- * 通过 OpenClaw CLI 获取 eligible skills 列表
+ * 异步通过 OpenClaw CLI 获取 skills 列表
  *
  * 使用命令：openclaw skills list --verbose --json
- *
- * 优点：
- * 1. 与 OpenClaw CLI 行为完全一致
- * 2. 使用官方的 eligible 判断逻辑
- * 3. 减少维护成本
+ * 使用异步 execFile 避免阻塞主线程
  */
-function collectSkills(logger?: PluginLogger): SkillInfo[] {
+async function collectSkillsAsync(): Promise<SkillInfo[]> {
     try {
-        const result = spawnSync("openclaw", ["skills", "list", "--verbose", "--json"], {
+        const { stdout, stderr } = await execFileAsync("openclaw", ["skills", "list", "--verbose", "--json"], {
             encoding: "utf-8",
-            timeout: 120_000, // 120 秒超时
+            timeout: 60_000,
+            env: { ...process.env, OPENCLAW_LOG_LEVEL: "silent" },
         });
 
-        if (result.error) {
-            logWarn("skills", "spawn_error", {
-                error: result.error.message,
-                code: (result.error as NodeJS.ErrnoException).code,
-            });
-            return [];
-        }
-
-        if (result.status !== 0) {
-            logWarn("skills", "exit_error", {
-                status: result.status,
-                signal: result.signal,
-            });
-            return [];
-        }
-
-        const output = result.stdout?.trim();
+        // skills CLI 可能将 JSON 输出到 stdout 或 stderr，两者都尝试
+        const output = (stdout?.trim() || stderr?.trim()) ?? "";
         if (!output) {
-            logWarn("skills", "empty_output", {});
+            logWarn("asset-report-service", "skills_empty_output", {
+                stdoutLength: stdout?.length ?? 0,
+                stderrLength: stderr?.length ?? 0,
+            });
             return [];
         }
 
         // 从输出中提取 JSON 部分（跳过日志前缀）
         const jsonOutput = extractJsonFromOutput(output);
         if (!jsonOutput) {
-            logWarn("skills", "no_json", {});
+            logDebug("asset-report-service", "skills_no_json", {});
             return [];
         }
 
@@ -308,20 +301,25 @@ function collectSkills(logger?: PluginLogger): SkillInfo[] {
         try {
             parsed = JSON.parse(jsonOutput);
         } catch (parseError) {
-            logWarn("skills", "parse_error", { error: String(parseError) });
+            logWarn("asset-report-service", "skills_parse_error", { error: String(parseError) });
             return [];
         }
 
         const skills = parsed.skills ?? [];
 
-        logDebug("skills", "collect_success", {
+        logDebug("asset-report-service", "skills_collect_success", {
             skillCount: skills.length,
             eligibleCount: skills.filter(s => s.eligible).length,
         });
 
         return skills;
-    } catch (e) {
-        logWarn("skills", "exception", { error: String(e) });
+    } catch (e: any) {
+        logWarn("asset-report-service", "skills_collect_error", {
+            error: e?.message || String(e),
+            code: e?.code,
+            signal: e?.signal,
+            stderrPreview: e?.stderr?.trim().slice(0, 500) || "(empty)",
+        });
         return [];
     }
 }
@@ -462,44 +460,47 @@ function extractJsonFromOutput(output: string): string {
     return output.slice(jsonStart);
 }
 
+// ============================================================================
+// CLI Data Cache Types
+// ============================================================================
+
+/** CLI 数据异步缓存快照 */
+type CliDataSnapshot = {
+    skills: SkillInfo[];
+    plugins: PluginsListJsonOutput["plugins"];
+    refreshedAt: number;
+};
+
+/** 空快照（服务启动前或刷新失败时的安全默认值） */
+const EMPTY_SNAPSHOT: CliDataSnapshot = { skills: [], plugins: [], refreshedAt: 0 };
+
+// ============================================================================
+// Async CLI Data Collection
+// ============================================================================
+
 /**
- * 采集 Plugin tools 列表（不过滤，返回所有）
+ * 异步采集原始 plugins 列表（一次 CLI 调用，两个视图复用）
  *
  * 使用命令：openclaw plugins list --json
+ * 使用异步 execFile 避免阻塞主线程
  */
-function collectAllPluginTools(logger?: PluginLogger): ToolInfo[] {
+async function collectPluginsRawAsync(): Promise<PluginsListJsonOutput["plugins"]> {
     try {
-        const result = spawnSync("openclaw", ["plugins", "list", "--json"], {
+        const { stdout } = await execFileAsync("openclaw", ["plugins", "list", "--json"], {
             encoding: "utf-8",
-            timeout: 120_000, // 120 秒超时
+            timeout: 60_000,
+            env: { ...process.env, OPENCLAW_LOG_LEVEL: "silent" },
         });
 
-        if (result.error) {
-            logWarn("tools", "spawn_error", {
-                error: result.error.message,
-                code: (result.error as NodeJS.ErrnoException).code,
-            });
-            return [];
-        }
-
-        if (result.status !== 0) {
-            logWarn("tools", "exit_error", {
-                status: result.status,
-                signal: result.signal,
-            });
-            return [];
-        }
-
-        const output = result.stdout?.trim();
+        const output = stdout?.trim();
         if (!output) {
-            logWarn("tools", "empty_output", {});
+            logDebug("asset-report-service", "plugins_empty_output", {});
             return [];
         }
 
-        // 从输出中提取 JSON 部分（跳过日志前缀）
         const jsonOutput = extractJsonFromOutput(output);
         if (!jsonOutput) {
-            logWarn("tools", "no_json", {});
+            logDebug("asset-report-service", "plugins_no_json", {});
             return [];
         }
 
@@ -507,169 +508,65 @@ function collectAllPluginTools(logger?: PluginLogger): ToolInfo[] {
         try {
             parsed = JSON.parse(jsonOutput);
         } catch (parseError) {
-            logWarn("tools", "parse_error", { error: String(parseError) });
+            logWarn("asset-report-service", "plugins_parse_error", { error: String(parseError) });
             return [];
         }
 
         const plugins = parsed.plugins ?? [];
-
-        if (plugins.length === 0) {
-            logDebug("tools", "no_plugins", {});
-        }
-
-        const tools: ToolInfo[] = [];
-        for (const plugin of plugins) {
-            const pluginId = plugin.id;
-            const toolNames = plugin.toolNames ?? [];
-
-            if (toolNames.length === 0) {
-                continue;
-            }
-
-            for (const name of toolNames) {
-                tools.push({
-                    name,
-                    source: `plugin:${pluginId}`,
-                });
-            }
-        }
-
-        logDebug("tools", "collect_success", {
-            pluginCount: plugins.length,
-            toolCount: tools.length,
+        logDebug("asset-report-service", "plugins_collect_success", { pluginCount: plugins.length });
+        return plugins;
+    } catch (e: any) {
+        logWarn("asset-report-service", "plugins_collect_error", {
+            error: e?.message || String(e),
+            code: e?.code,
+            signal: e?.signal,
         });
-
-        return tools;
-    } catch (e) {
-        logWarn("tools", "exception", { error: String(e) });
         return [];
     }
 }
 
-/**
- * 采集 enabled 且 loaded plugin tools 的 ID 列表（用于 AgentInfo.tools）
- *
- * 使用命令：openclaw plugins list --json
- *
- * 筛选条件：enabled=true 且 status="loaded"
- */
-function collectEnabledLoadedPluginToolIds(logger?: PluginLogger): string[] {
-    try {
-        const result = spawnSync("openclaw", ["plugins", "list", "--json"], {
-            encoding: "utf-8",
-            timeout: 120_000, // 120 秒超时
-        });
-
-        if (result.error) {
-            logWarn("tools", "spawn_error", {
-                error: result.error.message,
-                code: (result.error as NodeJS.ErrnoException).code,
-            });
-            return [];
-        }
-
-        if (result.status !== 0) {
-            logWarn("tools", "exit_error", {
-                status: result.status,
-                signal: result.signal,
-            });
-            return [];
-        }
-
-        const output = result.stdout?.trim();
-        if (!output) {
-            logWarn("tools", "empty_output", {});
-            return [];
-        }
-
-        // 从输出中提取 JSON 部分（跳过日志前缀）
-        const jsonOutput = extractJsonFromOutput(output);
-        if (!jsonOutput) {
-            logWarn("tools", "no_json", {});
-            return [];
-        }
-
-        let parsed: PluginsListJsonOutput;
-        try {
-            parsed = JSON.parse(jsonOutput);
-        } catch (parseError) {
-            logWarn("tools", "parse_error", { error: String(parseError) });
-            return [];
-        }
-
-        const plugins = parsed.plugins ?? [];
-        const toolIds: string[] = [];
-
-        for (const plugin of plugins) {
-            // 筛选 enabled=true 且 status="loaded" 的 plugin
-            if (plugin.enabled !== true || plugin.status !== "loaded") {
-                continue;
-            }
-
-            const pluginId = plugin.id;
-            const toolNames = plugin.toolNames ?? [];
-
-            for (const name of toolNames) {
-                toolIds.push(`plugin:${pluginId}/${name}`);
-            }
-        }
-
-        logDebug("tools", "collect_enabled_success", {
-            pluginCount: plugins.length,
-            enabledLoadedCount: plugins.filter(p => p.enabled && p.status === "loaded").length,
-            toolCount: toolIds.length,
-        });
-
-        return toolIds;
-    } catch (e) {
-        logWarn("tools", "exception", { error: String(e) });
-        return [];
-    }
-}
-
-/**
- * 采集所有 tools 列表（core + 所有 plugin tools）
- *
- * @param logger 日志记录器
- * @returns 所有 tools 列表
- */
-function collectTools(logger?: PluginLogger): ToolInfo[] {
+/** 从缓存的 plugins 数据生成全量 tools 列表（纯函数，零开销） */
+function deriveAllPluginTools(plugins: PluginsListJsonOutput["plugins"]): ToolInfo[] {
     const tools: ToolInfo[] = [];
-
-    // 添加 core tools
-    for (const name of CORE_TOOLS) {
-        tools.push({
-            name,
-            source: "core",
-        });
+    for (const plugin of plugins) {
+        for (const name of plugin.toolNames ?? []) {
+            tools.push({ name, source: `plugin:${plugin.id}` });
+        }
     }
-
-    // 添加所有 plugin tools（不过滤）
-    tools.push(...collectAllPluginTools(logger));
-
     return tools;
 }
 
-/**
- * 生成 Agent 可用的 tool ID 列表
- *
- * 包含：core tools + enabled=true 且 status="loaded" 的 plugin tools
- *
- * @param logger 日志记录器
- * @returns tool ID 列表（格式：core/<name> 或 plugin:<id>/<name>）
- */
-function generateAgentToolIds(logger?: PluginLogger): string[] {
+/** 从缓存的 plugins 数据生成 enabled+loaded 的 tool ID 列表（纯函数，零开销） */
+function deriveEnabledLoadedPluginToolIds(plugins: PluginsListJsonOutput["plugins"]): string[] {
     const toolIds: string[] = [];
-
-    // 添加 core tools
-    for (const name of CORE_TOOLS) {
-        toolIds.push(`core/${name}`);
+    for (const plugin of plugins) {
+        if (plugin.enabled !== true || plugin.status !== "loaded") continue;
+        for (const name of plugin.toolNames ?? []) {
+            toolIds.push(`plugin:${plugin.id}/${name}`);
+        }
     }
-
-    // 添加 enabled=true 且 status="loaded" 的 plugin tools
-    toolIds.push(...collectEnabledLoadedPluginToolIds(logger));
-
     return toolIds;
+}
+
+/**
+ * 并行刷新 CLI 数据快照（skills + plugins 异步并行采集）
+ */
+async function refreshCliDataSnapshot(): Promise<CliDataSnapshot> {
+    const startMs = Date.now();
+    const [skills, plugins] = await Promise.all([
+        collectSkillsAsync(),
+        collectPluginsRawAsync(),
+    ]);
+
+    const snapshot: CliDataSnapshot = { skills, plugins, refreshedAt: Date.now() };
+
+    logDebug("asset-report-service", "snapshot_refreshed", {
+        skillCount: skills.length,
+        pluginCount: plugins.length,
+        durationMs: Date.now() - startMs,
+    });
+
+    return snapshot;
 }
 
 /**
@@ -687,16 +584,41 @@ export function createAssetReportService(params: {
     const timeoutMs = params.timeoutMs ?? 5_000;
 
     let timer: NodeJS.Timeout | null = null;
+    let cacheTimer: NodeJS.Timeout | null = null;
+    let snapshot: CliDataSnapshot = EMPTY_SNAPSHOT;
+    let refreshing = false;
 
-    async function reportOnce(logger: PluginLogger): Promise<void> {
+    /** 防并发刷新缓存快照 */
+    async function tryRefreshSnapshot(): Promise<void> {
+        if (refreshing) return;
+        // auth 未就绪时跳过刷新，避免无效 CLI 子进程开销
+        if (!isAuthServiceReady()) return;
+        refreshing = true;
+        try {
+            const newSnapshot = await refreshCliDataSnapshot();
+            // 仅当新快照包含有效数据，或旧快照从未刷新过时才替换
+            // 避免瞬态 CLI 错误冲掉有效缓存，导致 10 分钟内全部空上报
+            if (newSnapshot.skills.length > 0 || newSnapshot.plugins.length > 0 || snapshot.refreshedAt === 0) {
+                snapshot = newSnapshot;
+            } else {
+                logWarn("asset-report-service", "snapshot_empty_discarded", {
+                    skillCount: newSnapshot.skills.length,
+                    pluginCount: newSnapshot.plugins.length,
+                });
+            }
+        } catch (e: any) {
+            logWarn("asset-report-service", "snapshot_refresh_error", { error: String(e?.message || e) });
+        } finally {
+            refreshing = false;
+        }
+    }
+
+    async function reportOnce(): Promise<void> {
         // 认证服务未就绪时，跳过上报
         if (!isAuthServiceReady()) {
-            logWarn("asset_report", "skip", { reason: "auth service not ready" });
+            logWarn("asset-report-service", "skip", { reason: "auth service not ready" });
             return;
         }
-
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), timeoutMs);
 
         const url = buildUrl(protectServerAddr, ASSET_REPORT_PATH);
 
@@ -706,7 +628,7 @@ export function createAssetReportService(params: {
 
             // agentId 未设置时跳过上报（认证未完成）
             if (!ctx.agentId) {
-                logWarn("asset_report", "skip", { reason: "agentId not set" });
+                logWarn("asset-report-service", "skip", { reason: "agentId not set" });
                 return;
             }
 
@@ -723,17 +645,28 @@ export function createAssetReportService(params: {
             const stateDir = api.runtime.state.resolveStateDir();
             const providers = collectProviders(api.config);
 
-            // 采集 skills 信息
-            const skills = collectSkills(logger);
-
-            // 筛选可用的 skill ID 列表
+            // 从缓存快照读取 skills/plugins 数据（零开销，直接读内存）
+            const skills = snapshot.skills;
             const eligibleSkillIds = filterEligibleSkillIds(skills);
 
-            // 采集 tools 信息（所有 tools）
-            const tools = collectTools(logger);
+            // 缓存过期告警：超过 MAX_CACHE_AGE_MS 未刷新成功
+            if (snapshot.refreshedAt > 0 && Date.now() - snapshot.refreshedAt > MAX_CACHE_AGE_MS) {
+                logWarn("asset-report-service", "stale_cache", {
+                    ageMs: Date.now() - snapshot.refreshedAt,
+                });
+            }
 
-            // 生成 Agent 可用的 tool ID 列表（core + enabled=true 且 status="loaded" 的 plugin tools）
-            const toolIds = generateAgentToolIds(logger);
+            // 从缓存 plugins 数据派生 tools 列表（core + plugin tools）
+            const tools: ToolInfo[] = [
+                ...CORE_TOOLS.map(name => ({ name, source: "core" })),
+                ...deriveAllPluginTools(snapshot.plugins),
+            ];
+
+            // 生成 Agent 可用的 tool ID 列表（格式：core/<name> 或 plugin:<id>/<name>）
+            const toolIds: string[] = [
+                ...CORE_TOOLS.map(name => `core/${name}`),
+                ...deriveEnabledLoadedPluginToolIds(snapshot.plugins),
+            ];
 
             // 采集 agents 信息（传入可用的 skill ID 列表和 tool ID 列表）
             const agents = collectAgents(api.config, stateDir, eligibleSkillIds, toolIds);
@@ -752,52 +685,44 @@ export function createAssetReportService(params: {
                 },
             };
 
-            // 调试日志：上报数据
-            logDebug("asset_report", "payload", payload);
+            logDebug("asset-report-service", "payload", payload);
 
             const requestId = randomUUID();
-            // 从 auth-service 获取运行时的 access token
-            const authToken = getAccessToken();
+            const headers = buildApsHeaders({ requestId, contentType: "application/json" });
 
-            const headers: Record<string, string> = {
-                "Content-Type": "application/json",
-                "X-Request-Id": requestId,
-                "X-SDK-Version": SDK_VERSION,
-            };
+            // AbortController 仅覆盖 HTTP 请求，不包含数据准备时间
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), timeoutMs);
 
-            // 添加身份认证 header
-            if (authToken) {
-                headers["Authorization"] = `Bearer ${authToken}`;
-            }
-
-            const resp = await originalFetch(url, {
-                method: "POST",
-                signal: controller.signal,
-                headers,
-                body: JSON.stringify(payload),
-            });
-
-            if (!resp.ok) {
-                logWarn("asset_report", "failed", {
-                    status: resp.status,
-                    statusText: resp.statusText,
+            try {
+                const resp = await originalFetch(url, {
+                    method: "POST",
+                    signal: controller.signal,
+                    headers,
+                    body: JSON.stringify(payload),
                 });
-                return;
-            }
 
-            // 关键日志：上报成功
-            logInfo("asset_report", "success", {});
+                if (!resp.ok) {
+                    logWarn("asset-report-service", "failed", {
+                        status: resp.status,
+                        statusText: resp.statusText,
+                    });
+                    return;
+                }
+
+                logDebug("asset-report-service", "success", {});
+            } finally {
+                clearTimeout(t);
+            }
 
         } catch (e: any) {
-            logWarn("asset_report", "error", { error: String(e?.message || e) });
-        } finally {
-            clearTimeout(t);
+            logWarn("asset-report-service", "error", { error: String(e?.message || e) });
         }
     }
 
     return {
         id: "openclaw-security-assistant-asset-report",
-        start: async (ctx) => {
+        start: async (ctx: OpenClawPluginServiceContext) => {
             // 等待 auth-service 就绪
             const waitIntervalMs = 10_000; // 10 秒检查一次
             const maxWaitMs = 300_000; // 最多等待 5 分钟
@@ -805,25 +730,36 @@ export function createAssetReportService(params: {
 
             while (!isAuthServiceReady()) {
                 if (Date.now() - startTime > maxWaitMs) {
-                    logWarn("asset_report", "wait_timeout", { message: "auth service not ready after 5min" });
+                    logWarn("asset-report-service", "wait_timeout", { message: "auth service not ready after 5min" });
                     break;
                 }
-                logDebug("asset_report", "waiting", {});
+                logDebug("asset-report-service", "waiting", {});
                 await new Promise((resolve) => setTimeout(resolve, waitIntervalMs));
             }
 
-            // auth-service 就绪后，立即上报一次
+            // auth-service 就绪后，先刷新缓存快照再上报
             if (isAuthServiceReady()) {
-                await reportOnce(ctx.logger).catch(() => {});
+                await tryRefreshSnapshot();
+                await reportOnce().catch(() => {});
             }
 
+            // 定时刷新 CLI 数据缓存（10 分钟）
+            cacheTimer = setInterval(() => tryRefreshSnapshot(), CLI_CACHE_REFRESH_INTERVAL_MS);
+            cacheTimer.unref?.();
+
             // 定时上报
-            timer = setInterval(() => reportOnce(ctx.logger).catch(() => {}), intervalMs);
+            timer = setInterval(() => reportOnce().catch(() => {}), intervalMs);
             timer.unref?.();
 
-            logInfo("asset_report", "started", { intervalMs, timeoutMs });
+            logDebug("asset-report-service", "started", {
+                intervalMs,
+                timeoutMs,
+                cacheRefreshIntervalMs: CLI_CACHE_REFRESH_INTERVAL_MS,
+            });
         },
-        stop: async () => {
+        stop: async (ctx: OpenClawPluginServiceContext) => {
+            if (cacheTimer) clearInterval(cacheTimer);
+            cacheTimer = null;
             if (timer) clearInterval(timer);
             timer = null;
         },

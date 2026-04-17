@@ -8,12 +8,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { OpenClawPluginApi, OpenClawPluginService, PluginLogger } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk";
+import type { OpenClawPluginService, OpenClawPluginServiceContext } from "openclaw/plugin-sdk/core";
 import { SDK_VERSION } from "./config.js";
 import { getAgentRuntime, getRuntimeContext, setAgentId } from "./runtime.js";
 import { buildUrl } from "./utils.js";
 import {
-    logInfo,
     logWarn,
     logError,
     logDebug,
@@ -176,7 +176,7 @@ export async function triggerTokenRefresh(): Promise<boolean> {
         return false;
     }
 
-    logInfo("auth", "trigger_refresh", {});
+    logDebug("auth", "trigger_refresh", {});
     return tokenRefreshCallback();
 }
 
@@ -211,8 +211,7 @@ export function setAccessToken(token: string, logger?: PluginLogger, pluginDir?:
             ? new Date(currentJwtPayload.iat * 1000).toISOString()
             : "unknown";
 
-        // 关键日志：token 解析成功
-        logInfo("auth", "token_parsed", {
+        logDebug("auth", "token_parsed", {
             sub: currentJwtPayload.sub,
             aud: currentJwtPayload.aud,
             iss: currentJwtPayload.iss,
@@ -320,7 +319,7 @@ function loadAccessTokenFromFile(
             return false;
         }
 
-        logInfo("auth", "load_token_success", {
+        logDebug("auth", "load_token_success", {
             tokenLength: token.length,
             sub: currentJwtPayload.sub,
             exp: currentJwtPayload.exp
@@ -422,8 +421,7 @@ async function fetchAccessToken(
         }
 
         const isReused = data.code === 201;
-        // 关键日志：认证成功
-        logInfo("auth", "token_success", {
+        logDebug("auth", "token_success", {
             code: data.code,
             reused: isReused,
         });
@@ -509,8 +507,7 @@ async function fetchInstallToken(
             return null;
         }
 
-        // 关键日志：安装认证成功
-        logInfo("auth", "install_success", {});
+        logDebug("auth", "install_success", {});
 
         return data.data.access_token;
     } catch (e: any) {
@@ -628,10 +625,10 @@ export function createAuthService(params: {
             const payload = getJwtPayload();
             if (payload?.sub) {
                 setAgentId(payload.sub);
-                logInfo("auth", "agent_id_set", { agentId: payload.sub });
+                logDebug("auth", "agent_id_set", { agentId: payload.sub });
             }
 
-            logInfo("auth", "install_token_obtained", {});
+            logDebug("auth", "install_token_obtained", {});
             return true;
         }
 
@@ -710,7 +707,7 @@ export function createAuthService(params: {
                 isReady = true;
                 lastRefreshTime = Date.now();
                 startCheckTimer(logger);
-                logInfo("auth", "install_retry_success", {});
+                logDebug("auth", "install_retry_success", {});
             }
         }, retryIntervalMs);
         installRetryTimer.unref?.();
@@ -718,7 +715,7 @@ export function createAuthService(params: {
 
     return {
         id: "openclaw-security-assistant-auth",
-        start: async (ctx) => {
+        start: async (ctx: OpenClawPluginServiceContext) => {
             const logger = ctx.logger;
             const runtimeCtx = getRuntimeContext();
 
@@ -754,13 +751,13 @@ export function createAuthService(params: {
                     const payload = getJwtPayload();
                     if (payload?.sub) {
                         setAgentId(payload.sub);
-                        logInfo("auth", "agent_id_set", { agentId: payload.sub });
+                        logDebug("auth", "agent_id_set", { agentId: payload.sub });
                     }
 
                     isReady = true;
                     lastRefreshTime = Date.now();
                     startCheckTimer(logger);
-                    logInfo("auth", "started", { source: "token verified", code: result.code });
+                    logDebug("auth", "started", { source: "token verified", code: result.code });
                     return;
                 }
 
@@ -789,7 +786,7 @@ export function createAuthService(params: {
                 isReady = true;
                 lastRefreshTime = Date.now();
                 startCheckTimer(logger);
-                logInfo("auth", "started", { source: "install_key" });
+                logDebug("auth", "started", { source: "install_key" });
                 return;
             }
 

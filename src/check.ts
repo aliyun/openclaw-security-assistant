@@ -4,10 +4,8 @@
 
 import { randomUUID } from "node:crypto";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
-import { SDK_VERSION } from "./config.js";
-import { getAgentRuntime } from "./runtime.js";
-import { getAccessToken, isAuthServiceReady, triggerTokenRefresh } from "./auth-service.js";
-import { buildUrl } from "./utils.js";
+import { isAuthServiceReady, triggerTokenRefresh } from "./auth-service.js";
+import { buildUrl, buildApsHeaders } from "./utils.js";
 import { logWarn, logDebug } from "./logger.js";
 import type {
     CheckRequestContext,
@@ -95,28 +93,6 @@ export function filterSensitiveHeaders(headers: Record<string, string>): Record<
     return filtered;
 }
 
-/**
- * 构建安全检查请求 headers
- */
-export function buildSecurityCheckHeaders(requestId: string): Record<string, string> {
-    // 从 auth-service 获取运行时的 access token
-    const authToken = getAccessToken();
-
-    const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        "X-Request-Id": requestId,
-        "X-SDK-Version": SDK_VERSION,
-        "X-Agent-Runtime": getAgentRuntime(),
-    };
-
-    // 添加身份认证 header
-    if (authToken) {
-        headers["Authorization"] = `Bearer ${authToken}`;
-    }
-
-    return headers;
-}
-
 /** 默认安全检查超时时间（毫秒） */
 const DEFAULT_SECURITY_CHECK_TIMEOUT_MS = 2_000;
 
@@ -135,16 +111,16 @@ export async function callRemoteSecurityCheck(
     // 认证服务未就绪时，直接放行
     if (!isAuthServiceReady()) {
         logWarn("check", "skip", { reason: "auth service not ready, fail-open pass" });
-        return { request_id: "", action: "pass" };
+        return { request_id: "", action: "allow" };
     }
 
     const f = originalFetch ?? globalThis.fetch;
     if (!f) {
-        return { request_id: "", action: "pass" };
+        return { request_id: "", action: "allow" };
     }
 
     const requestId = randomUUID();
-    const headers = buildSecurityCheckHeaders(requestId);
+    const headers = buildApsHeaders({ requestId, contentType: "application/json" });
     // 将 direction 添加到 URL query 参数中
     const url = buildUrl(protectServerAddr, `${path}?direction=${direction}`);
     const timeout = timeoutMs ?? DEFAULT_SECURITY_CHECK_TIMEOUT_MS;
@@ -153,7 +129,7 @@ export async function callRemoteSecurityCheck(
     const t = setTimeout(() => controller.abort(), timeout);
 
     try {
-        logDebug("check", "request", { url, requestId, direction });
+        logDebug("check", "request", { requestId, direction, url });
 
         const resp = await f(url, {
             method: "POST",
@@ -163,7 +139,7 @@ export async function callRemoteSecurityCheck(
         });
 
         const json = (await resp.json()) as SecurityCheckResponse;
-        logDebug("check", "response", { requestId, action: json.action });
+        logDebug("check", "response", { requestId, direction, action: json.action, content: json.content });
 
         // 检测 token 超时错误码（402）
         if (json.error?.code === "402") {
@@ -178,7 +154,7 @@ export async function callRemoteSecurityCheck(
     } catch (e) {
         // 远程服务不可用/超时/JSON 异常：降级放行
         logWarn("check", "error", { requestId, error: String(e) });
-        return { request_id: requestId, action: "pass" };
+        return { request_id: requestId, action: "allow" };
     } finally {
         clearTimeout(t);
     }
@@ -210,11 +186,11 @@ export async function checkLlmRequest(
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, LLM_CHECK_PATH, "req", originalFetch, undefined, logger);
 
     if (result.error) {
-        // 错误时降级放行
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }
 
 /**
@@ -242,11 +218,11 @@ export async function checkLlmResponse(
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, LLM_CHECK_PATH, "resp", originalFetch, undefined, logger);
 
     if (result.error) {
-        // 错误时降级放行
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }
 
 /**
@@ -268,15 +244,17 @@ export async function checkToolCallRequest(
         agent_session_id: "mocked_session_id",
         llm_run_id: "mocked_run_id",
         tool_payload: toolPayload,
+        check_type: "tool",
     };
 
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, TOOL_CHECK_PATH, "req", originalFetch, undefined, logger);
 
     if (result.error) {
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
 }
 
 /**
@@ -300,13 +278,60 @@ export async function checkToolCallResponse(
         agent_session_id: "mocked_session_id",
         llm_run_id: "mocked_run_id",
         tool_payload: toolPayload,
+        check_type: "tool",
     };
 
     const result = await callRemoteSecurityCheck(payload, protectServerAddr, TOOL_CHECK_PATH, "resp", originalFetch, undefined, logger);
 
     if (result.error) {
-        return { action: "pass" };
+        // 远程服务返回错误时降级放行，避免阻断正常请求
+        return { action: "allow" };
     }
 
-    return { action: result.action ?? "pass", content: result.content };
+    return { action: result.action ?? "allow", content: result.content };
+}
+
+/** Skill 安全检测超时时间（毫秒），比通用检测略长 */
+const SKILL_CHECK_TIMEOUT_MS = 5_000;
+
+/**
+ * 检查 Skill 安全状态
+ *
+ * 复用 tool_check 接口，通过 check_type=skill 区分。
+ * 降级策略：认证未就绪/网络异常/超时/服务端错误均返回 allow。
+ *
+ * @param skillSha256 - Skill ZIP 的 SHA256
+ * @param protectServerAddr - APS 服务地址
+ * @param originalFetch - 未被安全助手包装的原始 fetch
+ * @returns 检测结果 { action, content }
+ */
+export async function checkSkillSecurity(
+    skillSha256: string,
+    protectServerAddr: string,
+    originalFetch: typeof globalThis.fetch | null,
+    logger?: { info?: (msg: string) => void; warn?: (msg: string) => void },
+): Promise<{ action: SecurityAction; content?: string }> {
+    const payload: SecurityCheckRequest = {
+        req_type: "tool_call",
+        check_type: "skill",
+        agent_session_id: "mocked_session_id",
+        llm_run_id: "mocked_run_id",
+        skill_sha256: skillSha256,
+    };
+
+    const result = await callRemoteSecurityCheck(
+        payload,
+        protectServerAddr,
+        TOOL_CHECK_PATH,
+        "req",
+        originalFetch,
+        SKILL_CHECK_TIMEOUT_MS,
+        logger,
+    );
+
+    if (result.error) {
+        return { action: "allow" };
+    }
+
+    return { action: result.action ?? "allow", content: result.content };
 }

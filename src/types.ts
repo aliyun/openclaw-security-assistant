@@ -3,10 +3,13 @@
  */
 
 /** 安全检查处置动作 */
-export type SecurityAction = "pass" | "block" | "hint";
+export type SecurityAction = "allow" | "block" | "hint";
 
 /** 请求类型枚举 */
 export type ReqType = "llm" | "tool_call";
+
+/** 检测类型：tool = Tool Call 检测，skill = Skill 运行时检测。LLM 检测时可省略 */
+export type CheckType = "tool" | "skill";
 
 /** 数据流向 */
 export type Direction = "req" | "resp";
@@ -59,6 +62,10 @@ export type SecurityCheckRequest = {
     llm_payload?: LlmPayload;
     /** Tool Call 请求/响应内容（当 req_type 为 tool_call 时必填） */
     tool_payload?: ToolCallPayload;
+    /** 检测类型：tool = Tool Call 检测，skill = Skill 运行时检测。LLM 检测时可省略 */
+    check_type?: CheckType;
+    /** Skill ZIP 的 SHA256（check_type=skill 时必填） */
+    skill_sha256?: string;
 };
 
 /** 安全检查错误信息 */

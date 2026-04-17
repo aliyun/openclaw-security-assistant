@@ -12,7 +12,7 @@ import * as crypto from "node:crypto";
 import { execSync } from "node:child_process";
 import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk";
 import type { SystemInfo, NodeRuntimeInfo, OpenClawInfo } from "./types.js";
-import { logWarn } from "./logger.js";
+import { logDebug, logWarn } from "./logger.js";
 
 // Re-export for convenience
 export type { OpenClawInfo };
@@ -135,10 +135,48 @@ function readRawMachineId(): string {
     }
 
     if (platform === "linux") {
-        // 直接读文件，无需 shell 命令
+        // 最高优先：从 wuying runtime.ini 中读取 DesktopId
+        try {
+            const runtimeIni = fs.readFileSync(
+                "/etc/cloudstream/runtime.ini",
+                "utf-8",
+            );
+            const iniMatch = runtimeIni.match(
+                /^DesktopId\s*=\s*(.+)$/m,
+            );
+            if (iniMatch?.[1]) return iniMatch[1].trim();
+            logDebug("runtime", "machine_id_runtime_ini_no_desktop_id", {
+                reason: "DesktopId field not found in runtime.ini",
+            });
+        } catch (err) {
+            logDebug("runtime", "machine_id_runtime_ini_unavailable", {
+                reason: err instanceof Error ? err.message : String(err),
+            });
+        }
+        // 次优先：从 cloud-init nocloud meta-data 中读取 desktop-id
+        try {
+            const metaData = fs.readFileSync(
+                "/var/lib/cloud/seed/nocloud/meta-data",
+                "utf-8",
+            );
+            const match = metaData.match(/^desktop-id:\s*(.+)$/m);
+            if (match?.[1]) return match[1].trim();
+            logDebug("runtime", "machine_id_nocloud_no_desktop_id", {
+                reason: "desktop-id field not found in meta-data",
+            });
+        } catch (err) {
+            logDebug("runtime", "machine_id_nocloud_unavailable", {
+                reason: err instanceof Error ? err.message : String(err),
+            });
+        }
+        // fallback: 读取标准 machine-id 文件
         try {
             return fs.readFileSync("/etc/machine-id", "utf-8").trim();
-        } catch {
+        } catch (err) {
+            logDebug("runtime", "machine_id_etc_unavailable", {
+                reason: err instanceof Error ? err.message : String(err),
+                fallback: "/var/lib/dbus/machine-id",
+            });
             return fs.readFileSync("/var/lib/dbus/machine-id", "utf-8").trim();
         }
     }
