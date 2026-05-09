@@ -43,6 +43,12 @@ const DEFAULT_AUTH_TIMEOUT_MS = 30_000;
 /** Install 重试间隔（默认 30 秒） */
 const DEFAULT_INSTALL_RETRY_INTERVAL_MS = 30 * 1000;
 
+/** auth/token 不可恢复错误码（token 本身已废弃，需 install_key 重新颁发） */
+const AUTH_UNRECOVERABLE_CODES = new Set<number>([400, 401, 403, 404]);
+
+/** install/token 不可恢复错误码（install_key 无效/解析失败，无法自愈） */
+const INSTALL_UNRECOVERABLE_CODES = new Set<number>([400, 401]);
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -140,8 +146,14 @@ let currentJwtPayload: JwtPayload | null = null;
 /** 认证服务是否就绪（有有效 token） */
 let isReady = false;
 
+/** 认证服务错误信息（仅在不可恢复的错误时设置，waiting 状态为 null） */
+let authErrMsg: string | null = null;
+
 /** Token 刷新回调函数（由 createAuthService 设置） */
 let tokenRefreshCallback: (() => Promise<boolean>) | null = null;
+
+/** 最近一次 install/token 调用的失败信息（成功时清空；仅用于状态透出观察点） */
+let lastInstallTokenError: { code: number; msg: string } | null = null;
 
 /**
  * 获取当前的 access token
@@ -162,6 +174,14 @@ export function getJwtPayload(): JwtPayload | null {
  */
 export function isAuthServiceReady(): boolean {
     return isReady;
+}
+
+/**
+ * 获取认证服务错误信息
+ * 仅在不可恢复的错误时返回非 null（如缺少 token 和 install_key）
+ */
+export function getAuthErrMsg(): string | null {
+    return authErrMsg;
 }
 
 /**
@@ -493,6 +513,7 @@ async function fetchInstallToken(
                 status: resp.status,
                 statusText: resp.statusText,
             });
+            lastInstallTokenError = { code: resp.status, msg: resp.statusText };
             return null;
         }
 
@@ -504,17 +525,20 @@ async function fetchInstallToken(
                 code: data.code,
                 msg: data.msg,
             });
+            lastInstallTokenError = { code: data.code, msg: data.msg };
             return null;
         }
 
         logDebug("auth", "install_success", {});
 
+        lastInstallTokenError = null;
         return data.data.access_token;
     } catch (e: any) {
         logWarn("auth", "install_error", {
             url,
             error: String(e?.message || e),
         });
+        lastInstallTokenError = { code: 0, msg: String(e?.message || e) };
         return null;
     } finally {
         clearTimeout(t);
@@ -586,7 +610,14 @@ export function createAuthService(params: {
                 // code=201: 无需任何操作，token 未变化
                 // 更新上次刷新时间
                 lastRefreshTime = Date.now();
+                // 状态透出：刷新成功即解除之前可能存在的 error
+                authErrMsg = null;
                 return true;
+            }
+            // 状态透出：仅在服务端明确返回不可恢复码时写入 authErrMsg
+            // 严格保持业务状态不变：不改 isReady、不清 token、不触碰定时器
+            if (AUTH_UNRECOVERABLE_CODES.has(result.code)) {
+                authErrMsg = `Token invalidated: ${result.msg || `code=${result.code}`}`;
             }
             return false;
         } finally {
@@ -705,9 +736,17 @@ export function createAuthService(params: {
             if (success) {
                 stopInstallRetryTimer();
                 isReady = true;
+                authErrMsg = null;
                 lastRefreshTime = Date.now();
                 startCheckTimer(logger);
                 logDebug("auth", "install_retry_success", {});
+            } else {
+                // 状态透出：仅在服务端明确返回不可恢复码时写入 authErrMsg；瞬时错误保持原状
+                // 不改控制流：重试定时器继续按原节奏轮询
+                const lastErr = lastInstallTokenError;
+                if (lastErr && INSTALL_UNRECOVERABLE_CODES.has(lastErr.code)) {
+                    authErrMsg = `install_key rejected: ${lastErr.msg || `code=${lastErr.code}`}`;
+                }
             }
         }, retryIntervalMs);
         installRetryTimer.unref?.();
@@ -755,6 +794,7 @@ export function createAuthService(params: {
                     }
 
                     isReady = true;
+                    authErrMsg = null;
                     lastRefreshTime = Date.now();
                     startCheckTimer(logger);
                     logDebug("auth", "started", { source: "token verified", code: result.code });
@@ -769,6 +809,7 @@ export function createAuthService(params: {
             // 步骤 2：没有有效 token，检查是否有 install_key
             if (!runtimeCtx.installKey) {
                 // 没有 install_key，启动失败
+                authErrMsg = "Missing install_key and access_token";
                 logError("auth", "start_failed", { message: "no valid token and no install_key" });
                 return;
             }
@@ -784,10 +825,18 @@ export function createAuthService(params: {
             if (success) {
                 // 成功获取 token，就绪
                 isReady = true;
+                authErrMsg = null;
                 lastRefreshTime = Date.now();
                 startCheckTimer(logger);
                 logDebug("auth", "started", { source: "install_key" });
                 return;
+            }
+
+            // 状态透出：仅在服务端明确返回不可恢复码时写入 authErrMsg；瞬时错误保持 null
+            // 不改控制流：重试定时器照常启动
+            const lastErr = lastInstallTokenError;
+            if (lastErr && INSTALL_UNRECOVERABLE_CODES.has(lastErr.code)) {
+                authErrMsg = `install_key rejected: ${lastErr.msg || `code=${lastErr.code}`}`;
             }
 
             // 步骤 4：获取失败，启动重试流程
@@ -802,6 +851,7 @@ export function createAuthService(params: {
             }
             isRefreshing = false;
             isReady = false;
+            authErrMsg = null;
             lastRefreshTime = 0;
             tokenRefreshCallback = null;
             clearAccessToken();

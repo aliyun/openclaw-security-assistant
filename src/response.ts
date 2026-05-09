@@ -5,7 +5,7 @@
  * 确保 AgentRuntime 能正确解析。
  */
 
-import type { SecurityAction } from "./types.js";
+import type { ReplacementPayload, SecurityAction } from "./report-types.js";
 import { isSseResponse } from "./fetch-utils.js";
 
 /** -------- SSE 判断 -------- */
@@ -160,6 +160,19 @@ export function buildHintResponseBody(
 }
 
 /** -------- 拦截响应构建 -------- */
+
+/**
+ * 从 APS 预组装的 ReplacementPayload 直接构造 Response
+ *
+ * 插件侧不做任何协议拼装，完全信任 APS 返回的 headers 和 body。
+ * HTTP 状态码固定为 200。
+ */
+export function buildResponseFromAps(payload: ReplacementPayload): Response {
+    return new Response(payload.body, {
+        status: 200,
+        headers: new Headers(payload.headers),
+    });
+}
 
 /**
  * 为被拦截的请求创建 OpenAI 格式响应

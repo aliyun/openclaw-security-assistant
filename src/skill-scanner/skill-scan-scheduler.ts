@@ -13,13 +13,11 @@
  * - enqueue 失败 → 不更新签名表，下个扫描周期自动重试
  */
 
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as os from "node:os";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import { SCAN_CYCLE_INTERVAL_MS, FORCE_RESCAN_TTL_MS, FORCE_RESCAN_EVERY_N_CYCLES, AUTH_WAIT_INTERVAL_MS, AUTH_WAIT_MAX_MS } from "./constants.js";
 import { SkillFingerprintStore, computeFingerprint } from "./skill-fingerprint-store.js";
 import { SkillScanQueue } from "./skill-scan-queue.js";
+import { resolveSkillRootDirs, collectSkillPaths } from "./skill-path-resolver.js";
 import { isAuthServiceReady } from "../auth-service.js";
 import { logInfo, logDebug, logWarn } from "../logger.js";
 
@@ -44,6 +42,8 @@ export class SkillScanScheduler {
     private scanning = false;
     /** 强制重扫周期计数器（每 FORCE_RESCAN_EVERY_N_CYCLES 个周期执行一次） */
     private forceRescanCycleCounter = 0;
+    /** 最近一轮扫描周期完成时间 */
+    private lastCycleAtValue: string | null = null;
 
     constructor(params: {
         stateDir: string;
@@ -143,6 +143,21 @@ export class SkillScanScheduler {
         return this.store;
     }
 
+    /** 调度器是否正在运行 */
+    get isRunning(): boolean {
+        return this.running;
+    }
+
+    /** 最近一轮扫描周期完成时间 */
+    get lastCycleAt(): string | null {
+        return this.lastCycleAtValue;
+    }
+
+    /** 待扫描的 skill 数量（队列积压） */
+    get pendingCount(): number {
+        return this.queue.size;
+    }
+
     // ========================================================================
     // 扫描周期
     // ========================================================================
@@ -169,14 +184,17 @@ export class SkillScanScheduler {
 
         try {
             // 1. 解析所有 skill 根目录
-            const rootDirs = this.resolveSkillRootDirs();
+            const rootDirs = resolveSkillRootDirs({
+                stateDir: this.stateDir,
+                openclawConfig: this.openclawConfig,
+            });
             if (rootDirs.length === 0) {
                 logDebug("skill_scanner", "cycle_no_root_dirs", {});
                 return;
             }
 
             // 2. 收集具体的 skill 路径
-            const skillPaths = await this.collectSkillPaths(rootDirs);
+            const skillPaths = await collectSkillPaths(rootDirs);
             if (skillPaths.length === 0) {
                 logDebug("skill_scanner", "cycle_no_skills", {
                     rootDirsCount: rootDirs.length,
@@ -296,6 +314,8 @@ export class SkillScanScheduler {
                 queueSize: this.queue.size,
                 durationMs: Date.now() - startTime,
             });
+
+            this.lastCycleAtValue = new Date().toISOString();
         } catch (err) {
             logWarn("skill_scanner", "cycle_error", {
                 error: err instanceof Error ? err.message : String(err),
@@ -305,345 +325,4 @@ export class SkillScanScheduler {
             this.scanning = false;
         }
     }
-
-    // ========================================================================
-    // Skill 目录解析
-    // ========================================================================
-
-    /**
-     * 解析所有需要扫描的 skill 根目录
-     *
-     * 覆盖以下来源：
-     * - 用户主目录下的固定路径（~/.openclaw/skills、~/.agents/skills）
-     * - stateDir 关联路径（兼容 OPENCLAW_STATE_DIR 环境变量覆盖场景）
-     * - 用户配置的额外目录（config.skills.load.extraDirs）
-     * - 所有 Agent workspace 下的 skills 和 .agents/skills
-     * - 已安装插件的 skill 目录（installPath/skills + 清单声明路径）
-     * - OpenClaw bundled skills（随应用发布，版本更新时可能变化）
-     */
-    private resolveSkillRootDirs(): string[] {
-        const roots = new Set<string>();
-        const home = os.homedir();
-
-        // 固定路径：用户主目录下的标准 skill 位置
-        roots.add(path.join(home, ".openclaw", "skills"));
-        roots.add(path.join(home, ".agents", "skills"));
-
-        // stateDir 关联路径（当 OPENCLAW_STATE_DIR 覆盖默认目录时与上述路径不同）
-        if (this.stateDir) {
-            roots.add(path.join(this.stateDir, "skills"));
-            roots.add(path.join(this.stateDir, ".agents", "skills"));
-        }
-
-        // 用户配置的额外 skill 目录
-        this.appendExtraDirs(roots);
-
-        // Agent workspace 下的 skill 目录（支持多 agent 多 workspace）
-        for (const wsDir of this.resolveAgentWorkspaceDirs()) {
-            roots.add(path.join(wsDir, "skills"));
-            roots.add(path.join(wsDir, ".agents", "skills"));
-        }
-
-        // 已安装插件的 skill 目录
-        this.appendPluginSkillDirs(roots);
-
-        // OpenClaw bundled skills（随应用发布）
-        this.appendBundledSkillsDir(roots);
-
-        return Array.from(roots);
-    }
-
-    /**
-     * 从 skills.load.extraDirs 配置收集额外 skill 目录
-     */
-    private appendExtraDirs(roots: Set<string>): void {
-        const extraDirs = this.openclawConfig.skills?.load?.extraDirs;
-        if (!Array.isArray(extraDirs)) return;
-
-        for (const raw of extraDirs) {
-            const cleaned = cleanPathInput(raw);
-            if (cleaned) {
-                roots.add(path.resolve(cleaned));
-            }
-        }
-    }
-
-    /**
-     * 从 agents 配置中收集所有 workspace 路径
-     *
-     * 包含 agents.defaults.workspace 和每个 agent 实例的独立 workspace。
-     */
-    private resolveAgentWorkspaceDirs(): string[] {
-        const config = this.openclawConfig;
-        const seen = new Set<string>();
-        const result: string[] = [];
-
-        const tryAdd = (raw: unknown): void => {
-            if (typeof raw !== "string") return;
-            const cleaned = cleanPathInput(raw);
-            if (!cleaned) return;
-            const resolved = path.resolve(cleaned);
-            if (seen.has(resolved)) return;
-            seen.add(resolved);
-            result.push(resolved);
-        };
-
-        tryAdd(config.agents?.defaults?.workspace);
-
-        for (const agent of config.agents?.list ?? []) {
-            tryAdd(agent?.workspace);
-        }
-
-        return result;
-    }
-
-    /**
-     * 从已安装插件中查找 skill 目录
-     *
-     * 两种发现方式：
-     * 1. 读取插件清单（openclaw.plugin.json）中显式声明的 skills 路径
-     * 2. 约定式查找 installPath/skills 子目录（兜底）
-     *
-     * 仅在目录实际存在时添加，避免为大量无 skill 的插件创建无效路径。
-     */
-    private appendPluginSkillDirs(roots: Set<string>): void {
-        const installs = this.openclawConfig.plugins?.installs;
-        if (!installs || typeof installs !== "object") return;
-
-        for (const record of Object.values(installs)) {
-            const cleaned = cleanPathInput(record?.installPath);
-            if (!cleaned) continue;
-
-            // 方式 1: 从插件清单读取显式声明的 skill 目录
-            this.readManifestSkillDirs(cleaned, roots);
-
-            // 方式 2: 约定式 skills 子目录
-            const conventionDir = path.join(cleaned, "skills");
-            try {
-                if (fs.existsSync(conventionDir)) {
-                    roots.add(conventionDir);
-                }
-            } catch {
-                // existsSync 可能在损坏的挂载点或权限问题时抛出异常
-            }
-        }
-    }
-
-    /**
-     * 读取插件清单中声明的 skill 目录路径
-     */
-    private readManifestSkillDirs(pluginDir: string, roots: Set<string>): void {
-        try {
-            const manifestPath = path.join(pluginDir, "openclaw.plugin.json");
-            const raw = fs.readFileSync(manifestPath, "utf-8");
-            const manifest = JSON.parse(raw);
-            if (!Array.isArray(manifest.skills)) return;
-
-            for (const entry of manifest.skills) {
-                const cleaned = cleanPathInput(entry);
-                if (!cleaned) continue;
-                const resolved = path.resolve(pluginDir, cleaned);
-                // 安全检查：路径不得逃逸出插件根目录
-                const relative = path.relative(pluginDir, resolved);
-                if (relative.startsWith("..") || path.isAbsolute(relative)) {
-                    logDebug("skill_scanner", "manifest_skill_path_escaped", {
-                        pluginDir,
-                        declaredPath: String(entry),
-                        resolved,
-                    });
-                    continue;
-                }
-                try {
-                    if (fs.existsSync(resolved)) {
-                        roots.add(resolved);
-                        logDebug("skill_scanner", "manifest_skill_dir_added", {
-                            pluginDir,
-                            skillDir: resolved,
-                        });
-                    }
-                } catch {
-                    // ignore
-                }
-            }
-        } catch (err) {
-            // 清单不存在时属正常情况（大多数插件无 skills 声明），仅记录 debug
-            logDebug("skill_scanner", "manifest_read_skipped", {
-                pluginDir,
-                reason: err instanceof Error ? err.message : String(err),
-            });
-        }
-    }
-
-    /**
-     * 定位 OpenClaw bundled skills 目录并添加到扫描根集合
-     *
-     * 查找策略（与框架 resolveBundledSkillsDir 对齐）：
-     * 1. 环境变量 OPENCLAW_BUNDLED_SKILLS_DIR 覆盖
-     * 2. 从 process.argv[1]（openclaw.mjs 入口）定位包根目录
-     *    - 直接路径 + symlink 解析两种候选
-     *    - 逐级向上查找 package.json.name === "openclaw"
-     * 3. 在包根目录下查找 skills/ 子目录
-     */
-    private appendBundledSkillsDir(roots: Set<string>): void {
-        // 环境变量覆盖（与框架 resolveBundledSkillsDir 行为一致）
-        const override = process.env.OPENCLAW_BUNDLED_SKILLS_DIR?.trim();
-        if (override) {
-            try {
-                if (fs.existsSync(override)) {
-                    roots.add(override);
-                    logDebug("skill_scanner", "bundled_skills_dir_env", { dir: override });
-                }
-            } catch {
-                // ignore
-            }
-            return;
-        }
-
-        // 从 process.argv[1] 定位 OpenClaw 包根目录
-        const argv1 = process.argv[1];
-        if (!argv1) return;
-
-        // 收集候选起始目录：直接路径 + symlink 解析
-        const candidates: string[] = [path.dirname(path.resolve(argv1))];
-        try {
-            const resolved = fs.realpathSync(path.resolve(argv1));
-            if (resolved !== path.resolve(argv1)) {
-                candidates.push(path.dirname(resolved));
-            }
-        } catch {
-            // realpathSync 在路径不存在时可能抛异常
-        }
-
-        // 逐级向上查找 package.json.name === "openclaw"，最多 6 层
-        for (const start of candidates) {
-            let current = start;
-            for (let depth = 0; depth < 6; depth++) {
-                try {
-                    const pkgRaw = fs.readFileSync(path.join(current, "package.json"), "utf-8");
-                    const pkg = JSON.parse(pkgRaw) as { name?: unknown };
-                    if (pkg.name === "openclaw") {
-                        const skillsDir = path.join(current, "skills");
-                        if (fs.existsSync(skillsDir)) {
-                            roots.add(skillsDir);
-                            logDebug("skill_scanner", "bundled_skills_dir_found", { dir: skillsDir });
-                            return;
-                        }
-                    }
-                } catch {
-                    // package.json 不存在或解析失败，继续向上
-                }
-                const parent = path.dirname(current);
-                if (parent === current) break;
-                current = parent;
-            }
-        }
-
-        logDebug("skill_scanner", "bundled_skills_dir_not_found", {});
-    }
-
-    // ========================================================================
-    // Skill 路径收集
-    // ========================================================================
-
-    /**
-     * 从 skill 根目录中收集具体的 skill 路径
-     *
-     * 两种结构：
-     * 1. 根目录本身就是 skill（包含 SKILL.md）→ 直接收录
-     * 2. 根目录下的子目录各自是 skill → 收录包含 SKILL.md 的子目录
-     *
-     * 使用 realpath 去重，避免符号链接导致同一 skill 被重复扫描。
-     */
-    private async collectSkillPaths(rootDirs: string[]): Promise<string[]> {
-        const skillPaths: string[] = [];
-        const seen = new Set<string>();
-
-        for (const rootDir of rootDirs) {
-            // 检查根目录是否存在
-            try {
-                const stat = await fs.promises.stat(rootDir);
-                if (!stat.isDirectory()) continue;
-            } catch {
-                continue;
-            }
-
-            // 情况 1: 根目录本身是 skill
-            const rootSkillMd = path.join(rootDir, "SKILL.md");
-            if (await fileExists(rootSkillMd)) {
-                const realPath = await safeRealpath(rootDir);
-                if (realPath && !seen.has(realPath)) {
-                    seen.add(realPath);
-                    skillPaths.push(rootDir);
-                }
-                // 根目录本身是 skill，不再扫描子目录
-                continue;
-            }
-
-            // 情况 2: 扫描子目录
-            let entries: fs.Dirent[];
-            try {
-                entries = await fs.promises.readdir(rootDir, { withFileTypes: true });
-            } catch {
-                continue;
-            }
-
-            for (const entry of entries) {
-                if (!entry.isDirectory()) continue;
-
-                const skillDir = path.join(rootDir, entry.name);
-                const skillMd = path.join(skillDir, "SKILL.md");
-
-                if (!(await fileExists(skillMd))) continue;
-
-                const realPath = await safeRealpath(skillDir);
-                if (!realPath || seen.has(realPath)) continue;
-
-                seen.add(realPath);
-                skillPaths.push(skillDir);
-            }
-        }
-
-        return skillPaths;
-    }
-}
-
-// ============================================================================
-// 工具函数
-// ============================================================================
-
-/** 检查文件是否存在 */
-async function fileExists(filePath: string): Promise<boolean> {
-    try {
-        await fs.promises.access(filePath);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-/** 安全获取 realpath（失败时返回 null） */
-async function safeRealpath(dirPath: string): Promise<string | null> {
-    try {
-        return await fs.promises.realpath(dirPath);
-    } catch {
-        return null;
-    }
-}
-
-/**
- * 清理路径输入：类型检查 + 去除空白 + 移除 null 字节 + ~ 展开
- *
- * 防御配置中可能出现的脏数据，返回 null 表示输入无效。
- */
-function cleanPathInput(raw: unknown): string | null {
-    if (typeof raw !== "string") return null;
-    let cleaned = raw.trim().replace(/\0/g, "");
-    if (!cleaned) return null;
-    // 支持 ~ 前缀展开为用户主目录（与核心 resolveUserPath 行为一致）
-    if (cleaned === "~") {
-        cleaned = os.homedir();
-    } else if (cleaned.startsWith("~/")) {
-        cleaned = path.join(os.homedir(), cleaned.slice(2));
-    }
-    return cleaned;
 }

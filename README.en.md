@@ -8,6 +8,8 @@
 - **Tool Call Security Audit**: Performs security checks before and after tool execution to prevent malicious calls and sensitive data leakage
 - **Skill Security Detection**: Periodically scans Skill file changes for security inspection, and blocks loading of Skills with security risks at runtime
 - **Global Fetch Interception**: Transparently intercepts underlying model calls via `global.fetch` hooking
+- **Runtime Status Exposure**: Query plugin health status in real time via CLI commands and HTTP endpoints
+- **Agent Runtime Observability**: Comprehensive collection of Agent runtime information for improved observability
 - **Intelligent Fail-Open**: Automatically allows requests through when the security service is unavailable (fail-open), ensuring business continuity
 
 ## Compatibility
@@ -19,6 +21,24 @@ Requires OpenClaw version >= `2026.2.26`.
 Visit the Alibaba Cloud AI Security Guardrail Console to obtain the OpenClaw runtime protection plugin. Powered by the Qwen audit model, it provides full-stack real-time protection against prompt injection, data leakage, tool abuse, and other risks — making security the solid foundation of your AI applications.
 
 Restart the Gateway after enabling the plugin for changes to take effect.
+
+## Status Query
+
+Query the current security protection status through multiple channels:
+
+### CLI Commands
+
+```bash
+# View health overview
+openclaw ali-osa health
+```
+
+### HTTP Endpoints
+
+```bash
+# Health check
+curl http://127.0.0.1:<GATEWAY_PORT>/plugin/openclaw-security-assistant/health
+```
 
 ## Configuration
 

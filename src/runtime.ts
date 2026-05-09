@@ -11,7 +11,7 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { execSync } from "node:child_process";
 import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk";
-import type { SystemInfo, NodeRuntimeInfo, OpenClawInfo } from "./types.js";
+import type { SystemInfo, NodeRuntimeInfo, OpenClawInfo } from "./asset-types.js";
 import { logDebug, logWarn } from "./logger.js";
 
 // Re-export for convenience
@@ -111,114 +111,214 @@ function collectNodeRuntimeInfo(): NodeRuntimeInfo {
 // Machine ID Generation
 // ============================================================================
 
-/** 读取原始机器 ID 的超时时间 */
+/** 持久化 raw machine ID 的文件名 */
+const RAW_MACHINE_ID_FILENAME = ".oc_sec_raw_machine_id";
+
+/**
+ * 读取可信环境的 raw machine ID（仅 Linux wuying 场景）
+ *
+ * 优先级：
+ * 1. 环境变量 INSTANCE_ID（ACS 容器场景，IS_ACS_INSTANCE=true 时）
+ * 2. /etc/cloudstream/runtime.ini 中的 DesktopId（wuying 云桌面）
+ * 3. /var/lib/cloud/seed/nocloud/meta-data 中的 desktop-id（cloud-init）
+ *
+ * @returns 可信 raw ID，不可用时返回 null
+ */
+function readTrustedRawId(): string | null {
+    if (process.platform !== "linux") return null;
+
+    // ACS 容器场景：通过环境变量获取 instance id
+    if (process.env.IS_ACS_INSTANCE === "true") {
+        const instanceId = process.env.INSTANCE_ID?.trim();
+        if (instanceId) return instanceId;
+        logDebug("runtime", "machine_id_acs_instance_id_empty", {
+            reason: "IS_ACS_INSTANCE is true but INSTANCE_ID is empty or unset",
+        });
+    }
+
+    // 最高优先：从 wuying runtime.ini 中读取 DesktopId
+    try {
+        const runtimeIni = fs.readFileSync(
+            "/etc/cloudstream/runtime.ini",
+            "utf-8",
+        );
+        const iniMatch = runtimeIni.match(
+            /^DesktopId\s*=\s*(.+)$/m,
+        );
+        if (iniMatch?.[1]) return iniMatch[1].trim();
+        logDebug("runtime", "machine_id_runtime_ini_no_desktop_id", {
+            reason: "DesktopId field not found in runtime.ini",
+        });
+    } catch (err) {
+        logDebug("runtime", "machine_id_runtime_ini_unavailable", {
+            reason: err instanceof Error ? err.message : String(err),
+        });
+    }
+    // 次优先：从 cloud-init nocloud meta-data 中读取 desktop-id
+    try {
+        const metaData = fs.readFileSync(
+            "/var/lib/cloud/seed/nocloud/meta-data",
+            "utf-8",
+        );
+        const match = metaData.match(/^desktop-id:\s*(.+)$/m);
+        if (match?.[1]) return match[1].trim();
+        logDebug("runtime", "machine_id_nocloud_no_desktop_id", {
+            reason: "desktop-id field not found in meta-data",
+        });
+    } catch (err) {
+        logDebug("runtime", "machine_id_nocloud_unavailable", {
+            reason: err instanceof Error ? err.message : String(err),
+        });
+    }
+
+    return null;
+}
+
+/** 平台原生 machine ID 读取超时（毫秒） */
 const MACHINE_ID_TIMEOUT_MS = 5_000;
 
 /**
- * 读取平台原始机器 ID（使用完整路径，避免 PATH 缺失问题）
+ * 读取平台原生 machine ID（兜底，不依赖文件持久化）
  *
- * - macOS: /usr/sbin/ioreg 读取 IOPlatformUUID
- * - Linux: 直接读取 /etc/machine-id（无需 shell）
- * - Windows: reg query 读取 MachineGuid
+ * - macOS: ioreg → IOPlatformUUID
+ * - Linux: /etc/machine-id → /var/lib/dbus/machine-id
+ * - Windows: Registry → MachineGuid
+ *
+ * @returns 平台原生 ID，不可用时返回 null
  */
-function readRawMachineId(): string {
+function readPlatformMachineId(): string | null {
     const platform = process.platform;
 
     if (platform === "darwin") {
-        const output = execSync(
-            "/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice",
-            { encoding: "utf-8", timeout: MACHINE_ID_TIMEOUT_MS },
-        );
-        const match = output.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
-        if (match?.[1]) return match[1];
-        throw new Error("Failed to parse IOPlatformUUID from ioreg output");
+        try {
+            const output = execSync(
+                "/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice",
+                { encoding: "utf-8", timeout: MACHINE_ID_TIMEOUT_MS },
+            );
+            const match = output.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+            if (match?.[1]) return match[1];
+            logDebug("runtime", "machine_id_ioreg_parse_failed", {
+                reason: "IOPlatformUUID not found in ioreg output",
+            });
+        } catch (err) {
+            logDebug("runtime", "machine_id_ioreg_unavailable", {
+                reason: err instanceof Error ? err.message : String(err),
+            });
+        }
+        return null;
     }
 
     if (platform === "linux") {
-        // 最高优先：从 wuying runtime.ini 中读取 DesktopId
+        // /etc/machine-id（systemd 标准）
         try {
-            const runtimeIni = fs.readFileSync(
-                "/etc/cloudstream/runtime.ini",
-                "utf-8",
-            );
-            const iniMatch = runtimeIni.match(
-                /^DesktopId\s*=\s*(.+)$/m,
-            );
-            if (iniMatch?.[1]) return iniMatch[1].trim();
-            logDebug("runtime", "machine_id_runtime_ini_no_desktop_id", {
-                reason: "DesktopId field not found in runtime.ini",
-            });
-        } catch (err) {
-            logDebug("runtime", "machine_id_runtime_ini_unavailable", {
-                reason: err instanceof Error ? err.message : String(err),
-            });
-        }
-        // 次优先：从 cloud-init nocloud meta-data 中读取 desktop-id
-        try {
-            const metaData = fs.readFileSync(
-                "/var/lib/cloud/seed/nocloud/meta-data",
-                "utf-8",
-            );
-            const match = metaData.match(/^desktop-id:\s*(.+)$/m);
-            if (match?.[1]) return match[1].trim();
-            logDebug("runtime", "machine_id_nocloud_no_desktop_id", {
-                reason: "desktop-id field not found in meta-data",
-            });
-        } catch (err) {
-            logDebug("runtime", "machine_id_nocloud_unavailable", {
-                reason: err instanceof Error ? err.message : String(err),
-            });
-        }
-        // fallback: 读取标准 machine-id 文件
-        try {
-            return fs.readFileSync("/etc/machine-id", "utf-8").trim();
+            const id = fs.readFileSync("/etc/machine-id", "utf-8").trim();
+            if (id) return id;
         } catch (err) {
             logDebug("runtime", "machine_id_etc_unavailable", {
                 reason: err instanceof Error ? err.message : String(err),
                 fallback: "/var/lib/dbus/machine-id",
             });
-            return fs.readFileSync("/var/lib/dbus/machine-id", "utf-8").trim();
         }
+        // /var/lib/dbus/machine-id（dbus 兜底）
+        try {
+            const id = fs.readFileSync("/var/lib/dbus/machine-id", "utf-8").trim();
+            if (id) return id;
+        } catch (err) {
+            logDebug("runtime", "machine_id_dbus_unavailable", {
+                reason: err instanceof Error ? err.message : String(err),
+            });
+        }
+        return null;
     }
 
     if (platform === "win32") {
-        const systemRoot = process.env.SystemRoot || "C:\\Windows";
-        const regPath = path.join(systemRoot, "System32", "reg.exe");
-        const output = execSync(
-            `"${regPath}" query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid`,
-            { encoding: "utf-8", timeout: MACHINE_ID_TIMEOUT_MS },
-        );
-        const match = output.match(/MachineGuid\s+REG_SZ\s+(.+)/);
-        if (match?.[1]) return match[1].trim();
-        throw new Error("Failed to read MachineGuid from registry");
+        try {
+            const systemRoot = process.env.SystemRoot || "C:\\Windows";
+            const regPath = path.join(systemRoot, "System32", "reg.exe");
+            const output = execSync(
+                `"${regPath}" query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid`,
+                { encoding: "utf-8", timeout: MACHINE_ID_TIMEOUT_MS },
+            );
+            const match = output.match(/MachineGuid\s+REG_SZ\s+(.+)/);
+            if (match?.[1]) return match[1].trim();
+            logDebug("runtime", "machine_id_registry_parse_failed", {
+                reason: "MachineGuid not found in registry output",
+            });
+        } catch (err) {
+            logDebug("runtime", "machine_id_registry_unavailable", {
+                reason: err instanceof Error ? err.message : String(err),
+            });
+        }
+        return null;
     }
 
-    throw new Error(`Unsupported platform: ${platform}`);
+    logDebug("runtime", "machine_id_unsupported_platform", { platform });
+    return null;
 }
 
 /**
- * 生成 Machine ID（基于机器 ID + gateway port）
+ * 按优先级获取 raw machine ID
  *
- * 策略：
- * 1. 使用 readRawMachineId() 通过完整路径读取系统机器 ID
- * 2. 全部失败后使用 hostname + port 生成确定性 fallback（同一台机器始终相同）
+ * 策略（四层兜底）：
+ * 1. 可信源优先（wuying/ACS）— 每次直接读取，不依赖文件缓存
+ * 2. 读取已持久化的 raw ID 文件（stateDir/.oc_sec_raw_machine_id）
+ * 3. 随机生成并持久化 — 仅持久化成功时返回，失败则降级
+ * 4. 平台原生 machine ID — 稳定兜底，不依赖文件持久化
  */
-function generateMachineId(gatewayPort: number | undefined): string {
-    const port = gatewayPort ?? 18789;
+function resolveRawMachineId(stateDir: string): string {
+    // 1. 可信源优先（wuying/ACS）— 每次直接读，不依赖文件缓存
+    const trusted = readTrustedRawId();
+    if (trusted) return trusted;
 
+    // 2. 读取已持久化的 raw ID
+    const idFile = path.join(stateDir, RAW_MACHINE_ID_FILENAME);
     try {
-        const rawMachineId = readRawMachineId();
-        const combined = `${rawMachineId}:${port}`;
-        const hash = crypto.createHash("sha256").update(combined).digest("hex");
-        return `mid_${hash}`;
+        const existing = fs.readFileSync(idFile, "utf-8").trim();
+        if (existing) return existing;
     } catch (err) {
-        // 使用 hostname 生成确定性 fallback
-        logWarn("runtime", "generate_machine_id_failed", { error: String(err) });
-        const hostname = os.hostname() || "unknown-host";
-        const combined = `hostname:${hostname}:${port}`;
-        const hash = crypto.createHash("sha256").update(combined).digest("hex");
-        return `mid_${hash}`;
+        logDebug("runtime", "raw_machine_id_file_not_found", {
+            path: idFile,
+            action: "will generate and persist a new one",
+        });
     }
+
+    // 3. 随机生成并持久化 — 仅持久化成功时返回
+    const generated = crypto.randomBytes(32).toString("hex");
+    try {
+        fs.writeFileSync(idFile, generated, "utf-8");
+        return generated;
+    } catch (err) {
+        logWarn("runtime", "raw_machine_id_persist_failed", {
+            error: err instanceof Error ? err.message : String(err),
+            action: "falling back to platform machine ID",
+        });
+    }
+
+    // 4. 平台原生 machine ID — 稳定兜底，不依赖文件持久化
+    const platformId = readPlatformMachineId();
+    if (platformId) return platformId;
+
+    // 极端降级：所有来源都失败，使用 hostname
+    const hostname = os.hostname() || "unknown-host";
+    logWarn("runtime", "raw_machine_id_all_sources_failed", {
+        action: "using hostname as last resort",
+        hostname,
+    });
+    return `hostname:${hostname}`;
+}
+
+/**
+ * 生成 Machine ID（基于 raw machine ID + gateway port）
+ *
+ * 最终格式：mid_<sha256-hex>
+ */
+function generateMachineId(stateDir: string, gatewayPort: number | undefined): string {
+    const port = gatewayPort ?? 18789;
+    const rawId = resolveRawMachineId(stateDir);
+    logDebug("runtime", "raw_machine_id_resolved", { rawId });
+    const combined = `${rawId}:${port}`;
+    const hash = crypto.createHash("sha256").update(combined).digest("hex");
+    return `mid_${hash}`;
 }
 
 /**
@@ -257,9 +357,10 @@ export function initializeRuntimeContext(
 
     const gatewayPort = config.gateway?.port;
     const version = config.meta?.lastTouchedVersion ?? "unknown";
+    const stateDir = runtime.state.resolveStateDir();
 
     runtimeContext = {
-        machineId: generateMachineId(gatewayPort),
+        machineId: generateMachineId(stateDir, gatewayPort),
         installKey: readInstallKey(pluginDir),
         system: collectSystemInfo(),
         nodeRuntime: collectNodeRuntimeInfo(),

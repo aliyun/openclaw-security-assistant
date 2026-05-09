@@ -2,6 +2,10 @@
   "id": "openclaw-security-assistant",
   "name": "openclaw-security-assistant Plugin",
   "description": "Security assistant plugin by Alibaba Cloud that provides LLM request/response protection, tool call security checks.",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": ["hook"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
