@@ -13,7 +13,8 @@
 
 import path from "node:path";
 import type { SkillFingerprintStore } from "../skill-scanner/skill-fingerprint-store.js";
-import { checkSkillSecurity } from "../check.js";
+import type { ReportMeta, BeforeToolCallPayload } from "../report-types.js";
+import { checkBeforeToolCall } from "../check.js";
 import { logDebug } from "../logger.js";
 
 /** 默认阻断消息（APS 未返回具体原因时使用） */
@@ -55,9 +56,15 @@ export function createSkillMdGuard(deps: SkillMdGuardDeps) {
      * 6. 判断结果：block → 返回阻断信息；否则放行
      *
      * @param resolvedPath - before_tool_call event.params 中的 path 值
+     * @param meta - Run 级上报 Meta
+     * @param payload - before_tool_call 的完整 Payload（已含 llm_call_id、tool_call_id、tool_payload）
      * @returns GuardResult 表示阻断，undefined 表示放行
      */
-    async function handleSkillMdRead(resolvedPath: string): Promise<GuardResult | undefined> {
+    async function handleSkillMdRead(
+        resolvedPath: string,
+        meta: ReportMeta,
+        payload: BeforeToolCallPayload,
+    ): Promise<GuardResult | undefined> {
         // 1. 路径匹配：仅拦截 SKILL.md 文件读取
         if (path.basename(resolvedPath) !== "SKILL.md") {
             return undefined;
@@ -86,10 +93,19 @@ export function createSkillMdGuard(deps: SkillMdGuardDeps) {
             return undefined;
         }
 
-        // 5. 查 APS（委托 check.ts 统一通信，共享 token 刷新和错误降级）
-        const result = await checkSkillSecurity(entry.zipSha256, protectServerAddr, originalFetch);
+        // 5. 查 APS（注入 skill 字段后复用 checkBeforeToolCall 接口）
+        const skillPayload: BeforeToolCallPayload = {
+            ...payload,
+            tool_payload: {
+                ...payload.tool_payload,
+                check_type: "skill" as const,
+                skill_sha256: entry.zipSha256,
+                skill_name: skillName,
+            },
+        };
+        const result = await checkBeforeToolCall(meta, skillPayload, protectServerAddr, originalFetch);
 
-        // 6. 判断结果（checkSkillSecurity 内部已处理降级，此处仅判断 action）
+        // 6. 判断结果（checkBeforeToolCall 内部已处理降级，此处仅判断 action）
         if (result.action === "block") {
             const blockReason = result.content || DEFAULT_BLOCK_REASON;
             logDebug("skill_guard", "guard_blocked", {

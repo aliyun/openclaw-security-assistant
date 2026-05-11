@@ -1,20 +1,34 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type {OpenClawPluginApi} from "openclaw/plugin-sdk";
 import {
     createOpenClawSecurityAssistantConfigSchema,
     resolveOpenClawSecurityAssistantConfig,
+    SDK_VERSION,
 } from "./src/config.js";
-import {createAssetReportService} from "./src/asset-report-service.js";
-import {createAuthService} from "./src/auth-service.js";
+import {createAssetReportService, getLastAssetReportAt, getLastAssetReportErrMsg} from "./src/asset-report-service.js";
+import {createAuthService, isAuthServiceReady, getJwtPayload, getAuthErrMsg} from "./src/auth-service.js";
 import {initializeRuntimeContext, getRuntimeContext} from "./src/runtime.js";
-import type {ProviderMatch, SecurityAction} from "./src/types.js";
+import type {ProviderMatch} from "./src/check.js";
+import type {SecurityAction, ReplacementPayload, BeforeToolCallPayload} from "./src/report-types.js";
 import {
-    checkLlmRequest,
-    checkLlmResponse,
-    checkToolCallRequest,
-    checkToolCallResponse,
+    OC_SEC_MARKER_PREFIX,
+    OC_SEC_MARKER_SUFFIX,
+    OC_SEC_MARKER_REGEX,
+    OC_SEC_MARKER_GLOBAL_REGEX,
+    encodeOcSecPayload,
+    decodeOcSecPayload,
+} from "./src/oc-sec.js";
+import {
     getProviderBaseUrls,
-    matchProviderByUrl
+    matchProviderByUrl,
+    filterSensitiveHeaders,
+    reportRunStart,
+    reportRunEnd,
+    checkBeforeLlmCall,
+    checkAfterLlmCall,
+    checkBeforeToolCall,
+    checkAfterToolCall,
 } from "./src/check.js";
 import {
     getMergedRequestHeaders,
@@ -25,6 +39,7 @@ import {
     isSseResponse,
 } from "./src/fetch-utils.js";
 import {
+    buildResponseFromAps,
     createSecurityResponse,
     guessRequestWantsSse,
 } from "./src/response.js";
@@ -35,8 +50,25 @@ import {
     logError,
     logDebug,
 } from "./src/logger.js";
+import {
+    createRunContext,
+    getRunContext,
+    hasRunContext,
+    nextTurn,
+    setLastLlmCallId,
+    getLastLlmCallId,
+    setParentInfo,
+    getRunIdBySessionKey,
+    markNewTrace,
+    cleanupRun,
+    cleanupSession,
+    buildReportMeta,
+} from "./src/run-context.js";
 import { SkillScanScheduler } from "./src/skill-scanner/skill-scan-scheduler.js";
 import { createSkillMdGuard } from "./src/skill-guard/skill-md-guard.js";
+import { initStatusCollector } from "./src/status/collector.js";
+import { registerStatusRoutes, registerStatusCommands } from "./src/status/routes.js";
+import { registerSecurityAssistantCli } from "./src/status/cli.js";
 
 // Body preview truncation limit for debug logs
 const BODY_PREVIEW_MAX_LENGTH = 500;
@@ -57,6 +89,26 @@ const plugin = {
     configSchema: createOpenClawSecurityAssistantConfigSchema(),
     description: "Security assistant plugin by Alibaba Cloud that provides LLM request/response protection, tool call security checks.",
     register(api: OpenClawPluginApi) {
+        // cli-metadata 注册模式下，框架仅收集 CLI 命令元数据，
+        // 注入的 runtime 为空对象（见 loader.ts `registrationMode: "cli-metadata"` 分支），
+        // 此阶段禁止访问 api.runtime.state / 注册 service / 包装 fetch。
+        // 此处提前注册 `ali-osa` 命令组，确保 `openclaw ali-osa ...` 能命中 owner 插件。
+        api.registerCli(
+            ({ program, config: cliConfig }) => {
+                registerSecurityAssistantCli(program, cliConfig);
+            },
+            {
+                descriptors: [{
+                    name: "ali-osa",
+                    description: "Alibaba Cloud OpenClaw Security Assistant status and diagnostics",
+                    hasSubcommands: true,
+                }],
+            },
+        );
+        if (api.registrationMode === "cli-metadata") {
+            return;
+        }
+
         // 获取插件目录
         const pluginDir = path.dirname(api.source);
 
@@ -165,7 +217,11 @@ const plugin = {
                 const url = getUrlFromFetchArgs(input);
 
                 // 1) 动态获取 provider baseUrl 列表并检查是否匹配
-                const providerUrls = getProviderBaseUrls(api.config);
+                // 使用 runtime.config.loadConfig() 获取最新配置快照，
+                // 确保 provider 热更新后 wrappedFetch 能感知新的 baseUrl 列表。
+                // api.config 是插件加载时的静态快照，热更新后不会自动更新。
+                const liveConfig = api.runtime.config?.loadConfig?.() ?? api.config;
+                const providerUrls = getProviderBaseUrls(liveConfig);
                 const matchedProvider = matchProviderByUrl(url, providerUrls);
 
                 // 未匹配任何 provider baseUrl，直接放行
@@ -177,6 +233,37 @@ const plugin = {
                 const reqHeaders = getMergedRequestHeaders(input, init);
                 const reqBodyText = await getRequestBodyText(input, init);
 
+                // ---- oc-sec 元数据提取 + 摘除 ----
+                let cleanBodyText = reqBodyText;
+                let ocSecSid: string | undefined;
+                let ocSecRid: string | undefined;
+
+                if (reqBodyText) {
+                    const markerMatch = reqBodyText.match(OC_SEC_MARKER_REGEX);
+                    if (markerMatch?.[1]) {
+                        // base64 decode the entire payload (sid=xx&rid=yy)
+                        const decoded = decodeOcSecPayload(markerMatch[1]);
+                        if (decoded) {
+                            ocSecSid = decoded.sid;
+                            ocSecRid = decoded.rid;
+                        }
+                        // strip markers from body
+                        cleanBodyText = reqBodyText.replace(OC_SEC_MARKER_GLOBAL_REGEX, "");
+
+                        logInfo("oc-sec", "extract", {
+                            callId,
+                            sid: ocSecSid,
+                            rid: ocSecRid,
+                            provider: matchedProvider.providerId,
+                            url,
+                            originalBodyLen: reqBodyText.length,
+                            cleanBodyLen: cleanBodyText.length,
+                        });
+                    } else {
+                        logDebug("oc-sec", "no_marker_found", { callId, provider: matchedProvider.providerId });
+                    }
+                }
+
                 logDebug("llm", "request", {
                     callId,
                     url,
@@ -186,42 +273,69 @@ const plugin = {
                     bodyPreview: reqBodyText?.slice(0, BODY_PREVIEW_MAX_LENGTH),
                 });
 
-                let reqAction: SecurityAction = "allow";
-                let reqContent: string | undefined;
-                try {
-                    const checkStart = Date.now();
-                    const result = await checkLlmRequest(
-                        {
-                            url,
-                            method,
-                            headers: reqHeaders,
-                            bodyText: reqBodyText,
-                        },
-                        protectServerAddr,
-                        originalFetch,
-                        api.logger,
-                    );
-                    reqAction = result.action;
-                    reqContent = result.content;
-                    const checkDurationMs = Date.now() - checkStart;
-                    if (reqAction !== "allow") {
-                        logInfo("llm", "request_check", {callId, action: reqAction, url, provider: matchedProvider.providerId, checkDurationMs});
+                // 聚合检测前置条件：fetch 流程中不会变化，统一判断一次
+                const runCtx = ocSecRid ? getRunContext(ocSecRid) : undefined;
+                const traceCtx = runCtx && ocSecRid
+                    ? {
+                        runCtx,
+                        rid: ocSecRid,
+                        llmCallId: randomUUID(),
+                        turnId: nextTurn(ocSecRid),
                     }
-                    logDebug("llm", "request_check_result", {callId, checkDurationMs});
-                } catch (e: any) {
-                    logWarn("llm", "request_check_failed", {
+                    : undefined;
+
+                if (traceCtx) {
+                    setLastLlmCallId(traceCtx.rid, traceCtx.llmCallId);
+                } else {
+                    logError("llm", "run_context_missing", {
                         callId,
                         url,
                         provider: matchedProvider.providerId,
-                        error: String(e?.message || e),
+                        sid: ocSecSid,
+                        rid: ocSecRid,
                     });
-                    reqAction = "allow";
+                }
+
+                let reqAction: SecurityAction = "allow";
+                let reqContent: string | undefined;
+                let reqPayload: ReplacementPayload | undefined;
+                if (traceCtx) {
+                    try {
+                        const checkStart = Date.now();
+                        const meta = buildReportMeta(traceCtx.runCtx);
+                        const result = await checkBeforeLlmCall(meta, {
+                            llm_call_id: traceCtx.llmCallId,
+                            turn_id: traceCtx.turnId,
+                            provider: traceCtx.runCtx.provider,
+                            model: traceCtx.runCtx.model,
+                            llm_payload: {
+                                url,
+                                method,
+                                headers: filterSensitiveHeaders(reqHeaders),
+                                body: cleanBodyText,
+                            },
+                        }, protectServerAddr, originalFetch);
+                        reqAction = result.action;
+                        reqContent = result.content;
+                        reqPayload = result.payload;
+                        const checkDurationMs = Date.now() - checkStart;
+                        if (reqAction !== "allow") {
+                            logInfo("llm", "request_check", {callId, action: reqAction, url, provider: matchedProvider.providerId, checkDurationMs});
+                        }
+                    } catch (e: unknown) {
+                        logWarn("llm", "request_check_failed", {
+                            callId,
+                            url,
+                            provider: matchedProvider.providerId,
+                            error: String(e instanceof Error ? e.message : e),
+                        });
+                        reqAction = "allow";
+                    }
                 }
 
                 const wantsSse = guessRequestWantsSse(url, reqHeaders, reqBodyText);
 
                 if (reqAction === "block") {
-                    const blockContent = reqContent ?? "当前提示词请求存在安全风险，已被安全组件拦截";
                     logInfo("llm", "request_blocked", {
                         callId,
                         url,
@@ -229,23 +343,53 @@ const plugin = {
                         streaming: wantsSse,
                     });
 
+                    // 优先使用 APS 预组装的响应
+                    if (reqPayload) {
+                        return buildResponseFromAps(reqPayload);
+                    }
+                    // 兜底：APS 未返回 responseBody，使用本地拼装
+                    const blockContent = reqContent ?? "当前提示词请求存在安全风险，已被安全组件拦截";
                     return createSecurityResponse(reqAction, blockContent, {
                         isRequest: true,
                         wantsSse,
                     })!;
                 }
 
-                // do fetch
+                // do fetch — 使用摘除 oc-sec 标记后的干净 body
+                // oc-sec 摘除后 LLM API 收到的是不含元数据的干净 prompt
                 let resp: Response;
                 const fetchStartTime = Date.now();
                 try {
-                    resp = await originalFetch(input as any, init);
-                } catch (e: any) {
+                    const bodyWasStripped = cleanBodyText !== reqBodyText && cleanBodyText !== undefined;
+                    if (bodyWasStripped) {
+                        logInfo("oc-sec", "body_stripped", {
+                            callId,
+                            provider: matchedProvider.providerId,
+                            originalLen: reqBodyText?.length ?? 0,
+                            cleanLen: cleanBodyText.length,
+                        });
+                        // 根据原始 fetch 参数结构决定如何替换 body
+                        if (init) {
+                            // init 存在：用干净 body 替换 init.body
+                            const cleanInit = { ...init, body: cleanBodyText };
+                            resp = await originalFetch(input as any, cleanInit as RequestInit);
+                        } else if (input instanceof Request) {
+                            // input 是 Request 对象且无 init：重建 Request
+                            const cleanReq = new Request(input, { body: cleanBodyText });
+                            resp = await originalFetch(cleanReq);
+                        } else {
+                            // 无法替换 body 的场景（string/URL input + 无 init），直接透传
+                            resp = await originalFetch(input as any, init);
+                        }
+                    } else {
+                        resp = await originalFetch(input as any, init);
+                    }
+                } catch (e: unknown) {
                     logError("fetch", "error", {
                         callId,
                         url,
                         provider: matchedProvider.providerId,
-                        error: String(e?.message || e),
+                        error: String(e instanceof Error ? e.message : e),
                         durationMs: Date.now() - fetchStartTime,
                     });
                     throw e;
@@ -274,36 +418,40 @@ const plugin = {
 
                 let respAction: SecurityAction = "allow";
                 let respContent: string | undefined;
-                try {
-                    const checkStart = Date.now();
-                    const result = await checkLlmResponse(
-                        {
+                let respPayload: ReplacementPayload | undefined;
+                if (traceCtx) {
+                    try {
+                        const checkStart = Date.now();
+                        const meta = buildReportMeta(traceCtx.runCtx);
+                        const result = await checkAfterLlmCall(meta, {
+                            llm_call_id: traceCtx.llmCallId,
+                            turn_id: traceCtx.turnId,
+                            provider: traceCtx.runCtx.provider,
+                            model: traceCtx.runCtx.model,
+                            llm_payload: {
+                                url,
+                                headers: filterSensitiveHeaders(respHeaders),
+                                body: respBodyForCheck,
+                                req_action: reqAction,
+                            },
+                        }, protectServerAddr, originalFetch);
+                        respAction = result.action;
+                        respContent = result.content;
+                        respPayload = result.payload;
+                        const checkDurationMs = Date.now() - checkStart;
+                        if (respAction !== "allow") {
+                            logInfo("llm", "response_check", {callId, action: respAction, url, provider: matchedProvider.providerId, checkDurationMs});
+                        }
+                    } catch (e: unknown) {
+                        logWarn("llm", "response_check_failed", {
+                            callId,
                             url,
-                            method,
+                            provider: matchedProvider.providerId,
                             status: resp.status,
-                            headers: respHeaders,
-                            respText: respBodyForCheck,
-                        },
-                        protectServerAddr,
-                        originalFetch,
-                        api.logger,
-                    );
-                    respAction = result.action;
-                    respContent = result.content;
-                    const checkDurationMs = Date.now() - checkStart;
-                    if (respAction !== "allow") {
-                        logInfo("llm", "response_check", {callId, action: respAction, url, provider: matchedProvider.providerId, checkDurationMs});
+                            error: String(e instanceof Error ? e.message : e),
+                        });
+                        respAction = "allow";
                     }
-                    logDebug("llm", "response_check_result", {callId, checkDurationMs});
-                } catch (e: any) {
-                    logWarn("llm", "response_check_failed", {
-                        callId,
-                        url,
-                        provider: matchedProvider.providerId,
-                        status: resp.status,
-                        error: String(e?.message || e),
-                    });
-                    respAction = "allow";
                 }
 
                 // hint OR 逻辑：请求或响应任一为 hint/block 时生效
@@ -341,6 +489,15 @@ const plugin = {
                         streaming: sse,
                     });
 
+                    // 优先使用 APS 预组装的响应：
+                    //   - respAction=block/hint 时 respPayload 为 APS 基于真实 LLM 响应构建的完整替换体
+                    //   - respAction=allow 但 reqAction=hint 时（请求阶段提示延迟到响应阶段应用），
+                    //     APS 在请求阶段无法预知真实响应内容，无法提供 payload，必须走本地拼装
+                    if (respAction !== "allow" && respPayload) {
+                        return buildResponseFromAps(respPayload);
+                    }
+
+                    // 兜底：APS 未返回 payload，使用本地拼装（覆盖 reqAction=hint + respAction=allow 场景）
                     const securityResp = createSecurityResponse(effectiveAction, content, {
                         isRequest: false,
                         wantsSse: sse,
@@ -371,11 +528,26 @@ const plugin = {
         // =========================================================================
 
         api.on("before_prompt_build", async (event, ctx) => {
-            logDebug("hook", "before_prompt_build", {
+            const sid = ctx.sessionId ?? "unknown";
+            const rid = ctx.runId ?? "unknown";
+
+            // Build oc-sec marker: base64-encode the entire sid=xx&rid=yy payload
+            // Format: <!-- oc-sec:BASE64(sid=VALUE&rid=VALUE) -->
+            const encoded = encodeOcSecPayload(sid, rid);
+            const marker = `${OC_SEC_MARKER_PREFIX}${encoded}${OC_SEC_MARKER_SUFFIX}`;
+
+            logInfo("hook", "before_prompt_build_inject", {
                 agentId: ctx.agentId,
                 sessionKey: ctx.sessionKey,
+                sessionId: sid,
+                runId: rid,
+                channelId: ctx.channelId,
+                modelProviderId: ctx.modelProviderId,
                 messagesCount: Array.isArray(event.messages) ? event.messages.length : 0,
+                markerPreview: marker,
             });
+
+            return { appendSystemContext: marker };
         });
 
         api.on("before_agent_start", async (event, ctx) => {
@@ -383,6 +555,18 @@ const plugin = {
                 agentId: ctx.agentId,
                 sessionKey: ctx.sessionKey,
                 messagesCount: Array.isArray(event.messages) ? event.messages.length : 0,
+            });
+        });
+
+        api.on("before_dispatch", async (event, ctx) => {
+            // before_dispatch 仅用户消息触发，Announce/SubAgent 不触发
+            // 标记此 session 即将开始新的用户交互，供 createRunContext 区分 Main Run 和 Announce Run
+            if (ctx.sessionKey) {
+                markNewTrace(ctx.sessionKey);
+            }
+            logDebug("hook", "before_dispatch", {
+                channelId: ctx.channelId,
+                sessionKey: ctx.sessionKey,
             });
         });
 
@@ -400,6 +584,23 @@ const plugin = {
                 provider: event.provider,
                 model: event.model,
             });
+
+            // Create RunContext (consumes parentInfo if sub-agent)
+            const runCtx = createRunContext({
+                runId: event.runId,
+                sessionId: event.sessionId,
+                sessionKey: ctx.sessionKey ?? "unknown",
+                agentId: ctx.agentId ?? "unknown",
+                channelId: ctx.channelId ?? "unknown",
+                provider: event.provider,
+                model: event.model,
+            });
+
+            // fire-and-forget run_start
+            const meta = buildReportMeta(runCtx);
+            reportRunStart(meta, { content: event.prompt }, protectServerAddr, originalFetch).catch((e) => {
+                logWarn("report", "run_start_failed", { runId: event.runId, error: String(e) });
+            });
         });
 
         api.on("llm_output", async (event, ctx) => {
@@ -410,6 +611,18 @@ const plugin = {
                 model: event.model,
                 usage: event.usage,
             });
+
+            // fire-and-forget run_end, then cleanup RunContext
+            const runCtx = getRunContext(event.runId);
+            if (runCtx) {
+                const meta = buildReportMeta(runCtx);
+                const content = event.assistantTexts?.join("\n") ?? "";
+                reportRunEnd(meta, { content }, protectServerAddr, originalFetch).catch((e) => {
+                    logWarn("report", "run_end_failed", { runId: event.runId, error: String(e) });
+                });
+                // Cleanup here after run_end report is sent (agent_end fires before llm_output)
+                cleanupRun(event.runId);
+            }
         });
 
         api.on("message_received", async (event, ctx) => {
@@ -444,12 +657,27 @@ const plugin = {
                 hasGuard: !!skillMdGuard,
             });
 
-            // 1. Skill 运行时安全检测（本地 + APS 查询，优先级高）
+            // Lookup RunContext (needed by both skill guard and tool check)
+            const runCtx = event.runId ? getRunContext(event.runId) : undefined;
+            if (!runCtx) {
+                logError("tool_call", "run_context_missing", { toolName: event.toolName, runId: event.runId });
+                return;
+            }
+
+            const meta = buildReportMeta(runCtx);
+            const llmCallId = event.runId ? getLastLlmCallId(event.runId) : undefined;
+            const toolCheckPayload: BeforeToolCallPayload = {
+                llm_call_id: llmCallId ?? randomUUID(),
+                tool_call_id: event.toolCallId ?? randomUUID(),
+                tool_payload: { check_type: "tool", name: event.toolName, parameters: event.params },
+            };
+
+            // 1. Skill runtime guard (local + APS query, higher priority)
             if (skillMdGuard && event.toolName === "read") {
                 try {
                     const filePath = typeof event.params?.path === "string" ? event.params.path : undefined;
                     if (filePath) {
-                        const guardResult = await skillMdGuard.handleSkillMdRead(filePath);
+                        const guardResult = await skillMdGuard.handleSkillMdRead(filePath, meta, toolCheckPayload);
                         if (guardResult?.block) {
                             logInfo("skill_guard", "skill_blocked", { toolName: event.toolName, path: filePath });
                             return { block: true, blockReason: guardResult.blockReason };
@@ -460,36 +688,24 @@ const plugin = {
                         toolName: event.toolName,
                         error: String(e instanceof Error ? e.message : e),
                     });
-                    // 异常时降级放行
                 }
             }
 
-            // 2. 通用 Tool Call 安全检测（远端 API，保持已有逻辑不变）
+            // 2. Tool call security check via new protocol
             try {
-                const result = await checkToolCallRequest(
-                    {
-                        name: event.toolName,
-                        parameters: event.params,
-                    },
-                    protectServerAddr,
-                    originalFetch,
-                );
+                const result = await checkBeforeToolCall(meta, toolCheckPayload, protectServerAddr, originalFetch);
 
-                logDebug("tool_call", "request_check", {
-                    toolName: event.toolName,
-                    action: result.action,
-                    params: event.params,
-                });
+                logDebug("tool_call", "request_check", { toolName: event.toolName, action: result.action });
 
                 if (result.action === "block") {
                     const blockReason = result.content ?? "Tool call blocked by security policy";
-                    logInfo("tool_call", "request_blocked", {toolName: event.toolName});
-                    return {block: true, blockReason};
+                    logInfo("tool_call", "request_blocked", { toolName: event.toolName });
+                    return { block: true, blockReason };
                 }
-            } catch (e: any) {
+            } catch (e: unknown) {
                 logWarn("tool_call", "request_check_failed", {
                     toolName: event.toolName,
-                    error: String(e?.message || e),
+                    error: String(e instanceof Error ? e.message : e),
                 });
             }
 
@@ -497,24 +713,33 @@ const plugin = {
         });
 
         api.on("after_tool_call", async (event, ctx) => {
-            // Tool Call 响应安全检测
+            const runCtx = event.runId ? getRunContext(event.runId) : undefined;
+            if (!runCtx) {
+                logError("tool_call", "after_run_context_missing", { toolName: event.toolName, runId: event.runId });
+                return;
+            }
+
             try {
-                const result = await checkToolCallResponse(
-                    {
+                const meta = buildReportMeta(runCtx);
+                const llmCallId = event.runId ? getLastLlmCallId(event.runId) : undefined;
+                const result = await checkAfterToolCall(meta, {
+                    llm_call_id: llmCallId ?? randomUUID(),
+                    tool_call_id: event.toolCallId ?? randomUUID(),
+                    tool_payload: {
+                        check_type: "tool",
                         name: event.toolName,
                         parameters: event.params,
                         result: event.result,
                         error: event.error,
+                        duration_ms: event.durationMs,
                     },
-                    protectServerAddr,
-                    originalFetch,
-                );
+                }, protectServerAddr, originalFetch);
 
-                logDebug("tool_call", "response_check", {toolName: event.toolName, action: result.action});
+                logDebug("tool_call", "response_check", { toolName: event.toolName, action: result.action });
 
                 if (result.action === "block" && event.result) {
                     const blockReason = result.content ?? "Tool result blocked by security policy";
-                    logInfo("tool_call", "response_blocked", {toolName: event.toolName});
+                    logInfo("tool_call", "response_blocked", { toolName: event.toolName });
                     const interceptedData = {
                         error: "Intercepted",
                         message: "The result has been intercepted.",
@@ -522,10 +747,8 @@ const plugin = {
                     };
                     const mutableResult = event.result as Record<string, unknown>;
                     const newContent = [
-                        {type: "text", text: JSON.stringify(interceptedData, null, 2)},
+                        { type: "text", text: JSON.stringify(interceptedData, null, 2) },
                     ];
-                    // Only overwrite content when it is an array or absent;
-                    // skip assignment for unexpected types to avoid corrupting unknown structures.
                     if (Array.isArray(mutableResult.content) || mutableResult.content === undefined) {
                         mutableResult.content = newContent;
                     } else {
@@ -534,18 +757,21 @@ const plugin = {
                             contentType: typeof mutableResult.content,
                         });
                     }
-                    // Always attach interception metadata so downstream can detect the block
                     mutableResult.details = interceptedData;
                 }
-            } catch (e: any) {
+            } catch (e: unknown) {
                 logWarn("tool_call", "response_check_failed", {
                     toolName: event.toolName,
-                    error: String(e?.message || e),
+                    error: String(e instanceof Error ? e.message : e),
                 });
             }
         });
 
         api.on("session_end", async (event, ctx) => {
+            // 清理 sessionKey 维度的所有状态（sessionRunId、sessionTrace、pendingNewTrace、parentInfo）
+            if (ctx.sessionKey) {
+                cleanupSession(ctx.sessionKey);
+            }
             logDebug("hook", "session_end", {
                 agentId: ctx.agentId,
                 sessionId: event.sessionId,
@@ -554,7 +780,127 @@ const plugin = {
             });
         });
 
+        api.on("subagent_spawned", async (event, ctx) => {
+            if (ctx.requesterSessionKey && ctx.runId) {
+                // ctx.runId 是子的 runId（框架行为），通过父 sessionKey 反查父的真实 runId
+                const actualParentRunId = getRunIdBySessionKey(ctx.requesterSessionKey);
+                // 查找父 RunContext 获取 trace_id
+                const parentRunCtx = actualParentRunId ? getRunContext(actualParentRunId) : undefined;
+                setParentInfo(event.childSessionKey, {
+                    parentSessionKey: ctx.requesterSessionKey,
+                    parentRunId: actualParentRunId ?? ctx.runId,
+                    traceId: parentRunCtx?.trace_id,
+                });
+            }
+            logDebug("hook", "subagent_spawned", {
+                childSessionKey: event.childSessionKey,
+                parentSessionKey: ctx.requesterSessionKey,
+                parentRunId: getRunIdBySessionKey(ctx.requesterSessionKey ?? ""),
+                childRunId: ctx.runId,
+            });
+        });
+
+        api.on("agent_end", async (event, ctx) => {
+            logDebug("hook", "agent_end", {
+                runId: ctx.runId,
+                success: event.success,
+                durationMs: event.durationMs,
+            });
+            // NOTE: Do NOT cleanupRun here. agent_end fires before llm_output,
+            // and llm_output needs the RunContext to send run_end report.
+            // Cleanup is done in llm_output after the report is sent.
+            // Safety net: deferred cleanup in case llm_output never fires.
+            if (ctx.runId) {
+                const runId = ctx.runId;
+                setTimeout(() => {
+                    if (hasRunContext(runId)) {
+                        logWarn("run_context", "deferred_cleanup", { runId, reason: "llm_output did not fire within timeout" });
+                        cleanupRun(runId);
+                    }
+                }, 30_000);
+            }
+        });
+
         logDebug("init", "hooks_registered", {});
+
+        // =========================================================================
+        // 3) Status reporting routes
+        // =========================================================================
+
+        const statusCollector = initStatusCollector(
+            "openclaw-security-assistant",
+            SDK_VERSION,
+        );
+
+        // Register health signals provider (reads live state from auth-service)
+        statusCollector.registerHealthSignals(() => ({
+            authReady: isAuthServiceReady(),
+            authErrMsg: getAuthErrMsg(),
+        }));
+
+        // Register module status providers
+        statusCollector.registerProvider("auth", () => {
+            const jwtPayload = getJwtPayload();
+            return {
+                ready: isAuthServiceReady(),
+                installKeyPresent: !!runtimeCtx.installKey,
+                userId: jwtPayload?.tenant_id || null,
+                agentId: runtimeCtx.agentId ?? null,
+                tokenExpiry: jwtPayload?.exp
+                    ? new Date(jwtPayload.exp * 1000).toISOString()
+                    : null,
+            };
+        });
+
+        statusCollector.registerProvider("assetReport", () => ({
+            lastReportAt: getLastAssetReportAt(),
+            lastReportErrMsg: getLastAssetReportErrMsg(),
+        }));
+
+        statusCollector.registerProvider("skillSecurity", () => {
+            const sched = skillScanScheduler;
+            if (!sched) {
+                return {
+                    status: "stopped",
+                    pendingCount: 0,
+                    lastScanAt: null,
+                    fingerprintStore: { totalSkills: 0, uploadedSkills: 0, skippedSkills: 0 },
+                };
+            }
+            return {
+                status: sched.isRunning ? "running" : "stopped",
+                pendingCount: sched.pendingCount,
+                lastScanAt: sched.lastCycleAt,
+                fingerprintStore: sched.fingerprintStore.getStats(),
+            };
+        });
+
+        statusCollector.registerProvider("config", () => ({
+            endpointAddr: config.endpointAddr,
+            protectServerAddr: config.protectServerAddr,
+            managementServerAddr: config.managementServerAddr,
+            debug: config.debug,
+        }));
+
+        statusCollector.registerProvider("runtime", () => ({
+            machineId: runtimeCtx.machineId,
+            openclawVersion: runtimeCtx.openclaw.version,
+            platform: runtimeCtx.system.platform,
+            arch: runtimeCtx.system.arch,
+            nodeVersion: runtimeCtx.nodeRuntime.version,
+            initializedAt: runtimeCtx.initializedAt,
+        }));
+
+        // Register HTTP routes for health and status endpoints
+        registerStatusRoutes(api, statusCollector);
+
+        // Register CLI commands for chat-facing status queries
+        registerStatusCommands(api, statusCollector);
+
+        // NOTE: `ali-osa` 命令组已在 register 开头（cli-metadata 模式前）注册，
+        // 此处不再重复注册，避免 full 模式下 registerCli 冲突。
+
+        logDebug("init", "status_routes_registered", {});
     },
 };
 

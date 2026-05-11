@@ -133,6 +133,23 @@ export class SkillFingerprintStore {
         return Array.from(this.entries.keys());
     }
 
+    /**
+     * 统计签名表各类别的 skill 数量（单次遍历）
+     *
+     * - totalSkills: 条目总数
+     * - uploadedSkills: zipSha256 !== null（已上传到 APS）
+     * - skippedSkills: truncated === true（因规模问题跳过）
+     */
+    getStats(): { totalSkills: number; uploadedSkills: number; skippedSkills: number } {
+        let uploaded = 0;
+        let skipped = 0;
+        for (const entry of this.entries.values()) {
+            if (entry.zipSha256 !== null) uploaded++;
+            if (entry.truncated) skipped++;
+        }
+        return { totalSkills: this.entries.size, uploadedSkills: uploaded, skippedSkills: skipped };
+    }
+
     // ========================================================================
     // 写入操作
     // ========================================================================
