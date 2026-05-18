@@ -4,6 +4,14 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 
+## [v1.4.0] - 2026-05-18
+
+### 新增
+1. 新增 Aliyun IDaaS Agent 身份凭据和密钥托管：支持扫描明文 API 密钥并自动替换为安全托管凭据
+
+### 变更
+1. Agent 运行时信息采集兼容性增强：支持 OpenClaw >= 2026.3.7 版本
+
 ## [v1.3.0] - 2026-05-09
 
 ### 新增
@@ -43,3 +51,4 @@
 [v1.1.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.1.0
 [v1.2.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.2.0
 [v1.3.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.3.0
+[v1.4.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.0

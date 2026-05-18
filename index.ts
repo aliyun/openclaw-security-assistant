@@ -8,9 +8,11 @@ import {
 } from "./src/config.js";
 import {createAssetReportService, getLastAssetReportAt, getLastAssetReportErrMsg} from "./src/asset-report-service.js";
 import {createAuthService, isAuthServiceReady, getJwtPayload, getAuthErrMsg} from "./src/auth-service.js";
+import {createConfigSyncService} from "./src/config-sync-service.js";
+import {createIdaasConfigDelegate, createIdaasService} from "./src/idaas/idaas-coordinator.js";
 import {initializeRuntimeContext, getRuntimeContext} from "./src/runtime.js";
 import type {ProviderMatch} from "./src/check.js";
-import type {SecurityAction, ReplacementPayload, BeforeToolCallPayload} from "./src/report-types.js";
+import type {SecurityAction, ReplacementPayload, BeforeToolCallPayload, RunContext} from "./src/report-types.js";
 import {
     OC_SEC_MARKER_PREFIX,
     OC_SEC_MARKER_SUFFIX,
@@ -159,7 +161,17 @@ const plugin = {
             }),
         );
 
-        // 1) 注册资产信息上报 service：定时上报系统资产信息
+        // 1) 注册配置同步服务：定时从 APS 拉取最新配置
+        api.registerService(
+            createConfigSyncService({
+                api,
+                originalFetch,
+                protectServerAddr,
+                delegates: [createIdaasConfigDelegate({ api, originalFetch })],
+            }),
+        );
+
+        // 2) 注册资产信息上报 service：定时上报系统资产信息
         api.registerService(
             createAssetReportService({
                 api,
@@ -170,7 +182,7 @@ const plugin = {
             }),
         );
 
-        // 2) 注册 Skill 安全扫描调度器：定时扫描 skill 变更，上报待检测文件
+        // 3) 注册 Skill 安全扫描调度器：定时扫描 skill 变更，上报待检测文件
         api.registerService({
             id: "skill-scan-scheduler",
             start(ctx) {
@@ -200,6 +212,14 @@ const plugin = {
                 skillMdGuard = null;
             },
         });
+
+        // 3.5) 注册统一 IdaaS service：初始化 access-token + hosting 模块，实际启停由 coordinator 控制
+        api.registerService(
+            createIdaasService({
+                api,
+                config: { scanIntervalMs: 600_000 },
+            }),
+        );
 
         // 检查 fetch 是否已被包装 - 防止重复加载
         const alreadyWrapped = (globalThis as any)[FETCH_WRAPPED_KEY];
@@ -274,13 +294,24 @@ const plugin = {
                 });
 
                 // 聚合检测前置条件：fetch 流程中不会变化，统一判断一次
-                const runCtx = ocSecRid ? getRunContext(ocSecRid) : undefined;
-                const traceCtx = runCtx && ocSecRid
+                // 优先通过 rid 直接查找 RunContext (>= v2026.3.28)
+                let runCtx: RunContext | undefined;
+                if (ocSecRid && ocSecRid !== "unknown") {
+                    runCtx = getRunContext(ocSecRid);
+                }
+                // 兜底通过 sid(sessionKey) 调用 getRunIdBySessionKey 回查 (<= v2026.3.24)
+                if (!runCtx && ocSecSid && ocSecSid !== "unknown") {
+                    const realRunId = getRunIdBySessionKey(ocSecSid);
+                    if (realRunId) {
+                        runCtx = getRunContext(realRunId);
+                    }
+                }
+                const traceCtx = runCtx
                     ? {
                         runCtx,
-                        rid: ocSecRid,
+                        rid: runCtx.run_id,
                         llmCallId: randomUUID(),
-                        turnId: nextTurn(ocSecRid),
+                        turnId: nextTurn(runCtx.run_id),
                     }
                     : undefined;
 
@@ -528,7 +559,7 @@ const plugin = {
         // =========================================================================
 
         api.on("before_prompt_build", async (event, ctx) => {
-            const sid = ctx.sessionId ?? "unknown";
+            const sid = ctx.sessionKey ?? "unknown";
             const rid = ctx.runId ?? "unknown";
 
             // Build oc-sec marker: base64-encode the entire sid=xx&rid=yy payload

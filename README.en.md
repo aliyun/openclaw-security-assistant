@@ -8,13 +8,14 @@
 - **Tool Call Security Audit**: Performs security checks before and after tool execution to prevent malicious calls and sensitive data leakage
 - **Skill Security Detection**: Periodically scans Skill file changes for security inspection, and blocks loading of Skills with security risks at runtime
 - **Global Fetch Interception**: Transparently intercepts underlying model calls via `global.fetch` hooking
+- **Credential and Secret Hosting**: Integrates Aliyun IDaaS to automatically scan plaintext API keys and replace them with securely hosted credentials
 - **Runtime Status Exposure**: Query plugin health status in real time via CLI commands and HTTP endpoints
 - **Agent Runtime Observability**: Comprehensive collection of Agent runtime information for improved observability
 - **Intelligent Fail-Open**: Automatically allows requests through when the security service is unavailable (fail-open), ensuring business continuity
 
 ## Compatibility
 
-Requires OpenClaw version >= `2026.2.26`.
+Requires OpenClaw version >= `2026.3.7`.
 
 ## Quick Start
 

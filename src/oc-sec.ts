@@ -30,7 +30,7 @@ export const OC_SEC_MARKER_GLOBAL_REGEX = /<!-- oc-sec:[A-Za-z0-9+/=]+ -->/g;
 
 /** oc-sec 元数据结构（嵌入 system prompt 的标记中） */
 export type OcSecMetadata = {
-    /** Session ID：会话级标识，跨多次对话持久化 */
+    /** Session Key：会话路由键，如 "agent:main:telegram:alice"，用于 rid 不可用时回查 runId */
     sid: string;
     /** Run ID：执行级标识，一条用户消息 = 一个 run */
     rid: string;
