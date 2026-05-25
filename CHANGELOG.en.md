@@ -4,6 +4,11 @@ This file documents all notable changes to the `@alicloud/openclaw-security-assi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v1.4.1] - 2026-05-22
+
+### Fixed
+1. Fixed LLM security detection bypass caused by OpenAI SDK upgrade in OpenClaw 2026.5.19
+
 ## [v1.4.0] - 2026-05-18
 
 ### Added
@@ -51,4 +56,5 @@ Initial v1.0.0 release with LLM and Tool Call request/response inspection and en
 [v1.1.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.1.0
 [v1.2.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.2.0
 [v1.3.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.3.0
+[v1.4.1]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.1
 [v1.4.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.0

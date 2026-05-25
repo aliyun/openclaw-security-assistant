@@ -1,4 +1,6 @@
 import path from "node:path";
+import process from "node:process";
+import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import type {OpenClawPluginApi} from "openclaw/plugin-sdk";
 import {
@@ -65,6 +67,7 @@ import {
     cleanupRun,
     cleanupSession,
     buildReportMeta,
+    buildOrphanMeta,
 } from "./src/run-context.js";
 import { SkillScanScheduler } from "./src/skill-scanner/skill-scan-scheduler.js";
 import { createSkillMdGuard } from "./src/skill-guard/skill-md-guard.js";
@@ -79,6 +82,12 @@ const BODY_PREVIEW_MAX_LENGTH = 500;
 const FETCH_WRAPPED_KEY = Symbol.for('openclaw-security-assistant.fetch-wrapped');
 // 缓存插件加载前的原始 fetch，确保所有内部调用（service、hook）都使用未被包装的 fetch
 const ORIGINAL_FETCH_KEY = Symbol.for('openclaw-security-assistant.original-fetch');
+
+// OpenClaw 核心 loadUndiciRuntimeDeps()（src/infra/net/undici-runtime.ts）
+// 在每次调用时检查此 globalThis key：若存在则使用注入的 deps（含 wrapped fetch），
+// 跳过默认 undici 加载。插件通过设置此 key 实现 LLM 请求拦截。
+const UNDICI_RUNTIME_DEPS_KEY = "__OPENCLAW_TEST_UNDICI_RUNTIME_DEPS__";
+const UNDICI_WRAPPED_KEY = Symbol.for('openclaw-security-assistant.undici-wrapped');
 
 // 模块级持久变量：跨 register() 调用保持存活，避免 gateway restart 触发的
 // 重新注册导致 hook 闭包引用新的 null 变量而 service.start() 尚未被框架调度
@@ -138,12 +147,14 @@ const plugin = {
         if (!(globalThis as any)[ORIGINAL_FETCH_KEY] && globalThis.fetch) {
             (globalThis as any)[ORIGINAL_FETCH_KEY] = globalThis.fetch;
         }
-        const originalFetch: typeof globalThis.fetch | undefined = (globalThis as any)[ORIGINAL_FETCH_KEY];
+        const _maybeFetch: typeof globalThis.fetch | undefined = (globalThis as any)[ORIGINAL_FETCH_KEY];
 
-        if (!originalFetch) {
+        if (!_maybeFetch) {
             logError("init", "fetch_unavailable", { message: "globalThis.fetch is not available" });
             return;
         }
+        // After guard: guaranteed non-undefined; re-bind to help TS narrow inside nested closures
+        const originalFetch = _maybeFetch;
 
         // 捕获配置用于闭包
         const protectServerAddr = config.protectServerAddr;
@@ -221,12 +232,326 @@ const plugin = {
             }),
         );
 
+        // =========================================================================
+        // 统一 LLM 请求安全检测管道
+        // globalThis.fetch 和 undici.fetch 共用此函数
+        // =========================================================================
+        async function interceptLlmFetch(opts: {
+            tag: string;
+            callId: number;
+            url: string;
+            matchedProvider: ProviderMatch;
+            input: RequestInfo | URL;
+            init: RequestInit | undefined;
+            doFetch: (input: any, init?: any) => Promise<Response>;
+        }): Promise<Response> {
+            const { tag, callId, url, matchedProvider, input, init, doFetch } = opts;
+
+            const method = getMethodFromFetchArgs(input, init);
+            const reqHeaders = getMergedRequestHeaders(input, init);
+            const reqBodyText = await getRequestBodyText(input, init);
+
+            // ---- oc-sec 元数据提取 + 摘除 ----
+            let cleanBodyText = reqBodyText;
+            let ocSecSid: string | undefined;
+            let ocSecRid: string | undefined;
+
+            if (reqBodyText) {
+                const markerMatch = reqBodyText.match(OC_SEC_MARKER_REGEX);
+                if (markerMatch?.[1]) {
+                    // base64 decode the entire payload (sid=xx&rid=yy)
+                    const decoded = decodeOcSecPayload(markerMatch[1]);
+                    if (decoded) {
+                        ocSecSid = decoded.sid;
+                        ocSecRid = decoded.rid;
+                    }
+                    // strip markers from body
+                    cleanBodyText = reqBodyText.replace(OC_SEC_MARKER_GLOBAL_REGEX, "");
+
+                    logInfo("oc-sec", "extract", {
+                        callId,
+                        sid: ocSecSid,
+                        rid: ocSecRid,
+                        provider: matchedProvider.providerId,
+                        url,
+                        originalBodyLen: reqBodyText.length,
+                        cleanBodyLen: cleanBodyText.length,
+                    });
+                } else {
+                    logDebug("oc-sec", "no_marker_found", { callId, provider: matchedProvider.providerId });
+                }
+            }
+
+            logDebug("llm", "request", {
+                callId,
+                url,
+                provider: matchedProvider.providerId,
+                method,
+                headerKeys: Object.keys(reqHeaders),
+                bodyPreview: reqBodyText?.slice(0, BODY_PREVIEW_MAX_LENGTH),
+            });
+
+            // 聚合检测前置条件：fetch 流程中不会变化，统一判断一次
+            // 优先通过 rid 直接查找 RunContext (>= v2026.3.28)
+            let runCtx: RunContext | undefined;
+            if (ocSecRid && ocSecRid !== "unknown") {
+                runCtx = getRunContext(ocSecRid);
+            }
+            // 兜底通过 sid(sessionKey) 调用 getRunIdBySessionKey 回查 (<= v2026.3.24)
+            if (!runCtx && ocSecSid && ocSecSid !== "unknown") {
+                const realRunId = getRunIdBySessionKey(ocSecSid);
+                if (realRunId) {
+                    runCtx = getRunContext(realRunId);
+                }
+            }
+
+            const traceCtx = runCtx
+                ? {
+                    meta: buildReportMeta(runCtx),
+                    llmCallId: randomUUID(),
+                    turnId: nextTurn(runCtx.run_id),
+                    provider: runCtx.provider,
+                    model: runCtx.model,
+                }
+                : {
+                    meta: buildOrphanMeta(),
+                    llmCallId: randomUUID(),
+                    turnId: 0,
+                    provider: matchedProvider.providerId,
+                    model: "unknown",
+                };
+
+            if (runCtx) {
+                setLastLlmCallId(runCtx.run_id, traceCtx.llmCallId);
+            } else {
+                logWarn("llm", "run_context_missing_fallback", {
+                    callId,
+                    url,
+                    provider: matchedProvider.providerId,
+                    sid: ocSecSid,
+                    rid: ocSecRid,
+                });
+            }
+
+            // ---- request check ----
+            let reqAction: SecurityAction = "allow";
+            let reqContent: string | undefined;
+            let reqPayload: ReplacementPayload | undefined;
+            try {
+                const checkStart = Date.now();
+                const result = await checkBeforeLlmCall(traceCtx.meta, {
+                    llm_call_id: traceCtx.llmCallId,
+                    turn_id: traceCtx.turnId,
+                    provider: traceCtx.provider,
+                    model: traceCtx.model,
+                    llm_payload: {
+                        url,
+                        method,
+                        headers: filterSensitiveHeaders(reqHeaders),
+                        body: cleanBodyText,
+                    },
+                }, protectServerAddr, originalFetch);
+                reqAction = result.action;
+                reqContent = result.content;
+                reqPayload = result.payload;
+                const checkDurationMs = Date.now() - checkStart;
+                if (reqAction !== "allow") {
+                    logInfo("llm", "request_check", { callId, action: reqAction, url, provider: matchedProvider.providerId, checkDurationMs });
+                }
+            } catch (e: unknown) {
+                logWarn("llm", "request_check_failed", {
+                    callId,
+                    url,
+                    provider: matchedProvider.providerId,
+                    error: String(e instanceof Error ? e.message : e),
+                });
+                reqAction = "allow";
+            }
+
+            const wantsSse = guessRequestWantsSse(url, reqHeaders, reqBodyText);
+
+            if (reqAction === "block") {
+                logInfo("llm", "request_blocked", {
+                    callId,
+                    url,
+                    provider: matchedProvider.providerId,
+                    streaming: wantsSse,
+                });
+
+                // 优先使用 APS 预组装的响应
+                if (reqPayload) {
+                    return buildResponseFromAps(reqPayload);
+                }
+                // 兜底：APS 未返回 responseBody，使用本地拼装
+                const blockContent = reqContent ?? "当前提示词请求存在安全风险，已被安全组件拦截";
+                return createSecurityResponse(reqAction, blockContent, {
+                    isRequest: true,
+                    wantsSse,
+                })!;
+            }
+
+            // do fetch — 使用摘除 oc-sec 标记后的干净 body
+            // oc-sec 摘除后 LLM API 收到的是不含元数据的干净 prompt
+            let resp: Response;
+            const fetchStartTime = Date.now();
+            try {
+                const bodyWasStripped = cleanBodyText !== reqBodyText && cleanBodyText !== undefined;
+                if (bodyWasStripped) {
+                    logInfo("oc-sec", "body_stripped", {
+                        callId,
+                        provider: matchedProvider.providerId,
+                        originalLen: reqBodyText?.length ?? 0,
+                        cleanLen: cleanBodyText.length,
+                    });
+                    // 根据原始 fetch 参数结构决定如何替换 body
+                    if (init) {
+                        // init 存在：用干净 body 替换 init.body
+                        const cleanInit = { ...init, body: cleanBodyText };
+                        resp = await doFetch(input, cleanInit);
+                    } else if (input instanceof Request) {
+                        // input 是 Request 对象且无 init：重建 Request
+                        const cleanReq = new Request(input, { body: cleanBodyText });
+                        resp = await doFetch(cleanReq, undefined);
+                    } else {
+                        // 无法替换 body 的场景（string/URL input + 无 init），直接透传
+                        resp = await doFetch(input, init);
+                    }
+                } else {
+                    resp = await doFetch(input, init);
+                }
+            } catch (e: unknown) {
+                logError(tag, "error", {
+                    callId,
+                    url,
+                    provider: matchedProvider.providerId,
+                    error: String(e instanceof Error ? e.message : e),
+                    durationMs: Date.now() - fetchStartTime,
+                });
+                throw e;
+            }
+
+            const respHeaders = headersToRecord(resp.headers);
+            const sse = isSseResponse(resp);
+
+            // clone body for check (NOTE: for SSE this reads full stream; ok for initial testing)
+            let respBodyForCheck = "";
+            try {
+                respBodyForCheck = await resp.clone().text();
+            } catch {
+                respBodyForCheck = "[unreadable response body]";
+            }
+
+            logDebug("llm", "response", {
+                callId,
+                url,
+                provider: matchedProvider.providerId,
+                status: resp.status,
+                sse,
+                durationMs: Date.now() - fetchStartTime,
+                bodyPreview: respBodyForCheck.slice(0, BODY_PREVIEW_MAX_LENGTH),
+            });
+
+            // ---- response check ----
+            let respAction: SecurityAction = "allow";
+            let respContent: string | undefined;
+            let respPayload: ReplacementPayload | undefined;
+            try {
+                const checkStart = Date.now();
+                const result = await checkAfterLlmCall(traceCtx.meta, {
+                    llm_call_id: traceCtx.llmCallId,
+                    turn_id: traceCtx.turnId,
+                    provider: traceCtx.provider,
+                    model: traceCtx.model,
+                    llm_payload: {
+                        url,
+                        headers: filterSensitiveHeaders(respHeaders),
+                        body: respBodyForCheck,
+                        req_action: reqAction,
+                    },
+                }, protectServerAddr, originalFetch);
+                respAction = result.action;
+                respContent = result.content;
+                respPayload = result.payload;
+                const checkDurationMs = Date.now() - checkStart;
+                if (respAction !== "allow") {
+                    logInfo("llm", "response_check", { callId, action: respAction, url, provider: matchedProvider.providerId, checkDurationMs });
+                }
+            } catch (e: unknown) {
+                logWarn("llm", "response_check_failed", {
+                    callId,
+                    url,
+                    provider: matchedProvider.providerId,
+                    status: resp.status,
+                    error: String(e instanceof Error ? e.message : e),
+                });
+                respAction = "allow";
+            }
+
+            // hint OR 逻辑：请求或响应任一为 hint/block 时生效
+            // 优先级：block > hint > allow
+            // 1. respAction=block → block（响应 block 内容）
+            // 2. respAction=hint → hint（响应 hint 内容）
+            // 3. reqAction=hint + respAction=allow → hint（请求 hint 内容）
+            const effectiveAction: SecurityAction =
+                respAction === "block" ? "block"
+                : respAction === "hint" ? "hint"
+                : reqAction === "hint" ? "hint"
+                : "allow";
+
+            if (effectiveAction === "block" || effectiveAction === "hint") {
+                // 根据来源选择内容
+                let content: string;
+                let logAction: string;
+
+                if (effectiveAction === "block") {
+                    content = respContent ?? "当前大模型响应存在安全风险，已被安全组件拦截";
+                    logAction = "response_blocked";
+                } else if (respAction === "hint") {
+                    content = respContent ?? "\n\n[安全提示：以上内容由模型生成，请注意甄别其中的外部链接。]";
+                    logAction = "response_hint";
+                } else {
+                    content = reqContent ?? "\n\n[安全提示：以上内容由模型生成，请注意甄别其中的外部链接。]";
+                    logAction = "request_hint_applied";
+                }
+
+                logInfo("llm", logAction, {
+                    callId,
+                    url,
+                    provider: matchedProvider.providerId,
+                    status: resp.status,
+                    streaming: sse,
+                });
+
+                // 优先使用 APS 预组装的响应：
+                //   - respAction=block/hint 时 respPayload 为 APS 基于真实 LLM 响应构建的完整替换体
+                //   - respAction=allow 但 reqAction=hint 时（请求阶段提示延迟到响应阶段应用），
+                //     APS 在请求阶段无法预知真实响应内容，无法提供 payload，必须走本地拼装
+                if (respAction !== "allow" && respPayload) {
+                    return buildResponseFromAps(respPayload);
+                }
+
+                // 兜底：APS 未返回 payload，使用本地拼装（覆盖 reqAction=hint + respAction=allow 场景）
+                const securityResp = createSecurityResponse(effectiveAction, content, {
+                    isRequest: false,
+                    wantsSse: sse,
+                    originalResponse: resp,
+                    originalBody: respBodyForCheck,
+                });
+
+                if (securityResp) {
+                    return securityResp;
+                }
+            }
+
+            logDebug("llm", "passed", { callId, durationMs: Date.now() - fetchStartTime });
+            return resp;
+        }
+
         // 检查 fetch 是否已被包装 - 防止重复加载
         const alreadyWrapped = (globalThis as any)[FETCH_WRAPPED_KEY];
         if (alreadyWrapped) {
             logDebug("init", "skip_double_wrap", {});
         } else {
-            // 用于追踪请求的计数器
             let fetchCallId = 0;
 
             const wrappedFetch: typeof globalThis.fetch = (async function wrappedFetch(
@@ -236,7 +561,7 @@ const plugin = {
                 const callId = ++fetchCallId;
                 const url = getUrlFromFetchArgs(input);
 
-                // 1) 动态获取 provider baseUrl 列表并检查是否匹配
+                // 动态获取 provider baseUrl 列表并检查是否匹配
                 // 使用 runtime.config.loadConfig() 获取最新配置快照，
                 // 确保 provider 热更新后 wrappedFetch 能感知新的 baseUrl 列表。
                 // api.config 是插件加载时的静态快照，热更新后不会自动更新。
@@ -249,302 +574,15 @@ const plugin = {
                     return originalFetch(input as any, init);
                 }
 
-                const method = getMethodFromFetchArgs(input, init);
-                const reqHeaders = getMergedRequestHeaders(input, init);
-                const reqBodyText = await getRequestBodyText(input, init);
-
-                // ---- oc-sec 元数据提取 + 摘除 ----
-                let cleanBodyText = reqBodyText;
-                let ocSecSid: string | undefined;
-                let ocSecRid: string | undefined;
-
-                if (reqBodyText) {
-                    const markerMatch = reqBodyText.match(OC_SEC_MARKER_REGEX);
-                    if (markerMatch?.[1]) {
-                        // base64 decode the entire payload (sid=xx&rid=yy)
-                        const decoded = decodeOcSecPayload(markerMatch[1]);
-                        if (decoded) {
-                            ocSecSid = decoded.sid;
-                            ocSecRid = decoded.rid;
-                        }
-                        // strip markers from body
-                        cleanBodyText = reqBodyText.replace(OC_SEC_MARKER_GLOBAL_REGEX, "");
-
-                        logInfo("oc-sec", "extract", {
-                            callId,
-                            sid: ocSecSid,
-                            rid: ocSecRid,
-                            provider: matchedProvider.providerId,
-                            url,
-                            originalBodyLen: reqBodyText.length,
-                            cleanBodyLen: cleanBodyText.length,
-                        });
-                    } else {
-                        logDebug("oc-sec", "no_marker_found", { callId, provider: matchedProvider.providerId });
-                    }
-                }
-
-                logDebug("llm", "request", {
+                return interceptLlmFetch({
+                    tag: "fetch",
                     callId,
                     url,
-                    provider: matchedProvider.providerId,
-                    method,
-                    headerKeys: Object.keys(reqHeaders),
-                    bodyPreview: reqBodyText?.slice(0, BODY_PREVIEW_MAX_LENGTH),
+                    matchedProvider,
+                    input,
+                    init,
+                    doFetch: originalFetch,
                 });
-
-                // 聚合检测前置条件：fetch 流程中不会变化，统一判断一次
-                // 优先通过 rid 直接查找 RunContext (>= v2026.3.28)
-                let runCtx: RunContext | undefined;
-                if (ocSecRid && ocSecRid !== "unknown") {
-                    runCtx = getRunContext(ocSecRid);
-                }
-                // 兜底通过 sid(sessionKey) 调用 getRunIdBySessionKey 回查 (<= v2026.3.24)
-                if (!runCtx && ocSecSid && ocSecSid !== "unknown") {
-                    const realRunId = getRunIdBySessionKey(ocSecSid);
-                    if (realRunId) {
-                        runCtx = getRunContext(realRunId);
-                    }
-                }
-                const traceCtx = runCtx
-                    ? {
-                        runCtx,
-                        rid: runCtx.run_id,
-                        llmCallId: randomUUID(),
-                        turnId: nextTurn(runCtx.run_id),
-                    }
-                    : undefined;
-
-                if (traceCtx) {
-                    setLastLlmCallId(traceCtx.rid, traceCtx.llmCallId);
-                } else {
-                    logError("llm", "run_context_missing", {
-                        callId,
-                        url,
-                        provider: matchedProvider.providerId,
-                        sid: ocSecSid,
-                        rid: ocSecRid,
-                    });
-                }
-
-                let reqAction: SecurityAction = "allow";
-                let reqContent: string | undefined;
-                let reqPayload: ReplacementPayload | undefined;
-                if (traceCtx) {
-                    try {
-                        const checkStart = Date.now();
-                        const meta = buildReportMeta(traceCtx.runCtx);
-                        const result = await checkBeforeLlmCall(meta, {
-                            llm_call_id: traceCtx.llmCallId,
-                            turn_id: traceCtx.turnId,
-                            provider: traceCtx.runCtx.provider,
-                            model: traceCtx.runCtx.model,
-                            llm_payload: {
-                                url,
-                                method,
-                                headers: filterSensitiveHeaders(reqHeaders),
-                                body: cleanBodyText,
-                            },
-                        }, protectServerAddr, originalFetch);
-                        reqAction = result.action;
-                        reqContent = result.content;
-                        reqPayload = result.payload;
-                        const checkDurationMs = Date.now() - checkStart;
-                        if (reqAction !== "allow") {
-                            logInfo("llm", "request_check", {callId, action: reqAction, url, provider: matchedProvider.providerId, checkDurationMs});
-                        }
-                    } catch (e: unknown) {
-                        logWarn("llm", "request_check_failed", {
-                            callId,
-                            url,
-                            provider: matchedProvider.providerId,
-                            error: String(e instanceof Error ? e.message : e),
-                        });
-                        reqAction = "allow";
-                    }
-                }
-
-                const wantsSse = guessRequestWantsSse(url, reqHeaders, reqBodyText);
-
-                if (reqAction === "block") {
-                    logInfo("llm", "request_blocked", {
-                        callId,
-                        url,
-                        provider: matchedProvider.providerId,
-                        streaming: wantsSse,
-                    });
-
-                    // 优先使用 APS 预组装的响应
-                    if (reqPayload) {
-                        return buildResponseFromAps(reqPayload);
-                    }
-                    // 兜底：APS 未返回 responseBody，使用本地拼装
-                    const blockContent = reqContent ?? "当前提示词请求存在安全风险，已被安全组件拦截";
-                    return createSecurityResponse(reqAction, blockContent, {
-                        isRequest: true,
-                        wantsSse,
-                    })!;
-                }
-
-                // do fetch — 使用摘除 oc-sec 标记后的干净 body
-                // oc-sec 摘除后 LLM API 收到的是不含元数据的干净 prompt
-                let resp: Response;
-                const fetchStartTime = Date.now();
-                try {
-                    const bodyWasStripped = cleanBodyText !== reqBodyText && cleanBodyText !== undefined;
-                    if (bodyWasStripped) {
-                        logInfo("oc-sec", "body_stripped", {
-                            callId,
-                            provider: matchedProvider.providerId,
-                            originalLen: reqBodyText?.length ?? 0,
-                            cleanLen: cleanBodyText.length,
-                        });
-                        // 根据原始 fetch 参数结构决定如何替换 body
-                        if (init) {
-                            // init 存在：用干净 body 替换 init.body
-                            const cleanInit = { ...init, body: cleanBodyText };
-                            resp = await originalFetch(input as any, cleanInit as RequestInit);
-                        } else if (input instanceof Request) {
-                            // input 是 Request 对象且无 init：重建 Request
-                            const cleanReq = new Request(input, { body: cleanBodyText });
-                            resp = await originalFetch(cleanReq);
-                        } else {
-                            // 无法替换 body 的场景（string/URL input + 无 init），直接透传
-                            resp = await originalFetch(input as any, init);
-                        }
-                    } else {
-                        resp = await originalFetch(input as any, init);
-                    }
-                } catch (e: unknown) {
-                    logError("fetch", "error", {
-                        callId,
-                        url,
-                        provider: matchedProvider.providerId,
-                        error: String(e instanceof Error ? e.message : e),
-                        durationMs: Date.now() - fetchStartTime,
-                    });
-                    throw e;
-                }
-
-                const respHeaders = headersToRecord(resp.headers);
-                const sse = isSseResponse(resp);
-
-                // clone body for check (NOTE: for SSE this reads full stream; ok for initial testing)
-                let respBodyForCheck = "";
-                try {
-                    respBodyForCheck = await resp.clone().text();
-                } catch {
-                    respBodyForCheck = "[unreadable response body]";
-                }
-
-                logDebug("llm", "response", {
-                    callId,
-                    url,
-                    provider: matchedProvider.providerId,
-                    status: resp.status,
-                    sse,
-                    durationMs: Date.now() - fetchStartTime,
-                    bodyPreview: respBodyForCheck.slice(0, BODY_PREVIEW_MAX_LENGTH),
-                });
-
-                let respAction: SecurityAction = "allow";
-                let respContent: string | undefined;
-                let respPayload: ReplacementPayload | undefined;
-                if (traceCtx) {
-                    try {
-                        const checkStart = Date.now();
-                        const meta = buildReportMeta(traceCtx.runCtx);
-                        const result = await checkAfterLlmCall(meta, {
-                            llm_call_id: traceCtx.llmCallId,
-                            turn_id: traceCtx.turnId,
-                            provider: traceCtx.runCtx.provider,
-                            model: traceCtx.runCtx.model,
-                            llm_payload: {
-                                url,
-                                headers: filterSensitiveHeaders(respHeaders),
-                                body: respBodyForCheck,
-                                req_action: reqAction,
-                            },
-                        }, protectServerAddr, originalFetch);
-                        respAction = result.action;
-                        respContent = result.content;
-                        respPayload = result.payload;
-                        const checkDurationMs = Date.now() - checkStart;
-                        if (respAction !== "allow") {
-                            logInfo("llm", "response_check", {callId, action: respAction, url, provider: matchedProvider.providerId, checkDurationMs});
-                        }
-                    } catch (e: unknown) {
-                        logWarn("llm", "response_check_failed", {
-                            callId,
-                            url,
-                            provider: matchedProvider.providerId,
-                            status: resp.status,
-                            error: String(e instanceof Error ? e.message : e),
-                        });
-                        respAction = "allow";
-                    }
-                }
-
-                // hint OR 逻辑：请求或响应任一为 hint/block 时生效
-                // 优先级：block > hint > allow
-                // 1. respAction=block → block（响应 block 内容）
-                // 2. respAction=hint → hint（响应 hint 内容）
-                // 3. reqAction=hint + respAction=allow → hint（请求 hint 内容）
-                const effectiveAction: SecurityAction =
-                    respAction === "block" ? "block"
-                    : respAction === "hint" ? "hint"
-                    : reqAction === "hint" ? "hint"
-                    : "allow";
-
-                if (effectiveAction === "block" || effectiveAction === "hint") {
-                    // 根据来源选择内容
-                    let content: string;
-                    let logAction: string;
-
-                    if (effectiveAction === "block") {
-                        content = respContent ?? "当前大模型响应存在安全风险，已被安全组件拦截";
-                        logAction = "response_blocked";
-                    } else if (respAction === "hint") {
-                        content = respContent ?? "\n\n[安全提示：以上内容由模型生成，请注意甄别其中的外部链接。]";
-                        logAction = "response_hint";
-                    } else {
-                        content = reqContent ?? "\n\n[安全提示：以上内容由模型生成，请注意甄别其中的外部链接。]";
-                        logAction = "request_hint_applied";
-                    }
-
-                    logInfo("llm", logAction, {
-                        callId,
-                        url,
-                        provider: matchedProvider.providerId,
-                        status: resp.status,
-                        streaming: sse,
-                    });
-
-                    // 优先使用 APS 预组装的响应：
-                    //   - respAction=block/hint 时 respPayload 为 APS 基于真实 LLM 响应构建的完整替换体
-                    //   - respAction=allow 但 reqAction=hint 时（请求阶段提示延迟到响应阶段应用），
-                    //     APS 在请求阶段无法预知真实响应内容，无法提供 payload，必须走本地拼装
-                    if (respAction !== "allow" && respPayload) {
-                        return buildResponseFromAps(respPayload);
-                    }
-
-                    // 兜底：APS 未返回 payload，使用本地拼装（覆盖 reqAction=hint + respAction=allow 场景）
-                    const securityResp = createSecurityResponse(effectiveAction, content, {
-                        isRequest: false,
-                        wantsSse: sse,
-                        originalResponse: resp,
-                        originalBody: respBodyForCheck,
-                    });
-
-                    if (securityResp) {
-                        return securityResp;
-                    }
-                }
-
-                logDebug("llm", "passed", {callId, durationMs: Date.now() - fetchStartTime});
-
-                // allow: return original
-                return resp;
             } as unknown) as typeof globalThis.fetch;
 
             Object.assign(wrappedFetch, originalFetch);
@@ -553,6 +591,84 @@ const plugin = {
             logDebug("init", "fetch_interceptor_installed", {});
 
         } // end of if (!alreadyWrapped) fetch wrapping block
+
+        // =========================================================================
+        // 1.5) undici runtime deps 注入：拦截 fetchWithRuntimeDispatcher 路径
+        // OpenClaw transport 层通过 loadUndiciRuntimeDeps().fetch 发出 LLM 请求，
+        // 绕过 globalThis.fetch。通过注入 __OPENCLAW_TEST_UNDICI_RUNTIME_DEPS__
+        // 使 loadUndiciRuntimeDeps() 返回被包装的 fetch。
+        // =========================================================================
+        const alreadyWrappedUndici = (globalThis as any)[UNDICI_WRAPPED_KEY];
+        if (alreadyWrappedUndici) {
+            logDebug("init", "skip_undici_double_wrap", {});
+        } else {
+            try {
+                // 从 openclaw 进程入口解析 undici：
+                // process.argv[1] 是 openclaw CLI 入口，realpathSync follow symlink
+                // 后落在 openclaw 的实际安装目录，createRequire 从该位置向上查找 node_modules/undici
+                const pluginRequire = createRequire(import.meta.url);
+                const fs = pluginRequire("node:fs") as typeof import("node:fs");
+                const argv1 = process.argv[1];
+                if (!argv1) {
+                    throw new Error("process.argv[1] is empty, cannot locate openclaw installation");
+                }
+                const realPath = fs.realpathSync(path.resolve(argv1));
+                const hostRequire = createRequire(realPath);
+                const undici: {
+                    Agent: any;
+                    EnvHttpProxyAgent: any;
+                    ProxyAgent: any;
+                    FormData: any;
+                    fetch: typeof globalThis.fetch;
+                } = hostRequire("undici");
+                logDebug("init", "undici_loaded_from", { path: realPath });
+
+                const originalUndiciFetch = undici.fetch;
+                let undiciCallId = 0;
+
+                const wrappedUndiciFetch = (async function wrappedUndiciFetch(
+                    input: RequestInfo | URL,
+                    init?: RequestInit,
+                ): Promise<Response> {
+                    const callId = ++undiciCallId;
+                    const url = getUrlFromFetchArgs(input);
+
+                    const liveConfig = api.runtime.config?.loadConfig?.() ?? api.config;
+                    const providerUrls = getProviderBaseUrls(liveConfig);
+                    const matchedProvider = matchProviderByUrl(url, providerUrls);
+
+                    if (!matchedProvider) {
+                        return originalUndiciFetch(input as any, init as any);
+                    }
+
+                    return interceptLlmFetch({
+                        tag: "undici",
+                        callId,
+                        url,
+                        matchedProvider,
+                        input,
+                        init,
+                        doFetch: originalUndiciFetch,
+                    });
+                }) as unknown as typeof undici.fetch;
+
+                // 写入 globalThis override
+                (globalThis as any)[UNDICI_RUNTIME_DEPS_KEY] = {
+                    Agent: undici.Agent,
+                    EnvHttpProxyAgent: undici.EnvHttpProxyAgent,
+                    ProxyAgent: undici.ProxyAgent,
+                    FormData: undici.FormData,
+                    fetch: wrappedUndiciFetch,
+                };
+                (globalThis as any)[UNDICI_WRAPPED_KEY] = true;
+
+                logInfo("init", "undici_interceptor_installed", {});
+            } catch (e: unknown) {
+                logWarn("init", "undici_interceptor_failed", {
+                    error: String(e instanceof Error ? e.message : e),
+                });
+            }
+        } // end of undici wrapping block
 
         // =========================================================================
         // 2) hook observers (focused fields)
@@ -690,12 +806,10 @@ const plugin = {
 
             // Lookup RunContext (needed by both skill guard and tool check)
             const runCtx = event.runId ? getRunContext(event.runId) : undefined;
+            const meta = runCtx ? buildReportMeta(runCtx) : buildOrphanMeta();
             if (!runCtx) {
-                logError("tool_call", "run_context_missing", { toolName: event.toolName, runId: event.runId });
-                return;
+                logWarn("tool_call", "run_context_missing_fallback", { toolName: event.toolName, runId: event.runId });
             }
-
-            const meta = buildReportMeta(runCtx);
             const llmCallId = event.runId ? getLastLlmCallId(event.runId) : undefined;
             const toolCheckPayload: BeforeToolCallPayload = {
                 llm_call_id: llmCallId ?? randomUUID(),
@@ -745,13 +859,12 @@ const plugin = {
 
         api.on("after_tool_call", async (event, ctx) => {
             const runCtx = event.runId ? getRunContext(event.runId) : undefined;
+            const meta = runCtx ? buildReportMeta(runCtx) : buildOrphanMeta();
             if (!runCtx) {
-                logError("tool_call", "after_run_context_missing", { toolName: event.toolName, runId: event.runId });
-                return;
+                logWarn("tool_call", "after_run_context_missing_fallback", { toolName: event.toolName, runId: event.runId });
             }
 
             try {
-                const meta = buildReportMeta(runCtx);
                 const llmCallId = event.runId ? getLastLlmCallId(event.runId) : undefined;
                 const result = await checkAfterToolCall(meta, {
                     llm_call_id: llmCallId ?? randomUUID(),

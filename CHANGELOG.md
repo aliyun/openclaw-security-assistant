@@ -4,6 +4,11 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 
+## [v1.4.1] - 2026-05-22
+
+### 修复
+1. 修复 OpenClaw 2026.5.19 因 OpenAI SDK 升级可能带来的 LLM 检测失效问题
+
 ## [v1.4.0] - 2026-05-18
 
 ### 新增
@@ -51,4 +56,5 @@
 [v1.1.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.1.0
 [v1.2.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.2.0
 [v1.3.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.3.0
+[v1.4.1]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.1
 [v1.4.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.0
