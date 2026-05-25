@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { SDK_VERSION } from "./config.js";
 import { getAgentRuntime } from "./runtime.js";
 import { getAccessToken } from "./auth-service.js";
+import { getIdaasAccessToken } from "./idaas/idaas-access-token-service.js";
 
 /**
  * 拼接基础地址和路径生成完整 URL
@@ -47,6 +48,11 @@ export function buildApsHeaders(options?: {
 
     if (authToken) {
         headers["Authorization"] = `Bearer ${authToken}`;
+    }
+
+    const idaasToken = getIdaasAccessToken();
+    if (idaasToken) {
+        headers["X-IDAAS-Token"] = idaasToken;
     }
 
     return headers;
