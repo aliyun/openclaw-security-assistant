@@ -564,6 +564,7 @@ export function createAuthService(params: {
     // Token 检查定时器
     let checkTimer: NodeJS.Timeout | null = null;
     let installRetryTimer: NodeJS.Timeout | null = null;
+    let stopped = false;
     let isRefreshing = false;
     // 上次刷新时间（毫秒时间戳）
     let lastRefreshTime = 0;
@@ -752,9 +753,7 @@ export function createAuthService(params: {
         installRetryTimer.unref?.();
     }
 
-    return {
-        id: "openclaw-security-assistant-auth",
-        start: async (ctx: OpenClawPluginServiceContext) => {
+    async function startImpl(ctx: OpenClawPluginServiceContext): Promise<void> {
             const logger = ctx.logger;
             const runtimeCtx = getRuntimeContext();
 
@@ -777,6 +776,8 @@ export function createAuthService(params: {
                     logError("auth", "verify_error", { error: String(e) });
                     return null;
                 });
+
+                if (stopped) return;
 
                 if (result?.success && result.accessToken) {
                     // 服务端验证成功
@@ -822,6 +823,8 @@ export function createAuthService(params: {
                 return false;
             });
 
+            if (stopped) return;
+
             if (success) {
                 // 成功获取 token，就绪
                 isReady = true;
@@ -842,8 +845,17 @@ export function createAuthService(params: {
             // 步骤 4：获取失败，启动重试流程
             logDebug("auth", "started_waiting", {});
             startInstallRetry(logger);
+    }
+
+    return {
+        id: "openclaw-security-assistant-auth",
+        // fire-and-forget：不阻塞 gateway sidecar 启动
+        start: (ctx: OpenClawPluginServiceContext) => {
+            stopped = false;
+            void startImpl(ctx);
         },
         stop: async () => {
+            stopped = true;
             stopInstallRetryTimer();
             if (checkTimer) {
                 clearInterval(checkTimer);

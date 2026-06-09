@@ -4,6 +4,12 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 
+## [v1.4.2] - 2026-06-09
+
+### 修复
+1. 修复 Cron 任务每次执行复用相同 trace_id 的问题，现在每次触发生成独立 trace_id
+2. 修复插件未完成授权场景下 Service 启动导致 Gateway 加载历史聊天信息延迟的问题
+
 ## [v1.4.1] - 2026-05-22
 
 ### 修复
@@ -56,5 +62,6 @@
 [v1.1.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.1.0
 [v1.2.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.2.0
 [v1.3.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.3.0
+[v1.4.2]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.2
 [v1.4.1]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.1
 [v1.4.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.0

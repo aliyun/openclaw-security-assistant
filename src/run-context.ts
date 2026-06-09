@@ -9,6 +9,10 @@ import { randomUUID } from "node:crypto";
 import type { RunContext, ParentInfo, ReportMeta } from "./report-types.js";
 import { logDebug, logWarn } from "./logger.js";
 
+function isCronSessionKey(sessionKey: string): boolean {
+    return sessionKey.includes(":cron:");
+}
+
 // ============================================================================
 // 状态存储
 // ============================================================================
@@ -63,7 +67,7 @@ export function createRunContext(params: {
     // 根据 Run 类型确定 trace_id
     // 优先级：SubAgent 继承 > 用户发起（before_dispatch 标记）新建 > 其他（Announce 等）继承
     let traceId: string;
-    let runType: "main" | "subagent" | "announce";
+    let runType: "main" | "subagent" | "announce" | "cron";
     if (parentInfo?.traceId) {
         // SubAgent: 从父 Run 继承
         traceId = parentInfo.traceId;
@@ -72,6 +76,10 @@ export function createRunContext(params: {
         // Main Run: before_dispatch 已标记此 session 有新用户消息到达
         traceId = randomUUID();
         runType = "main";
+    } else if (isCronSessionKey(sessionKey)) {
+        // Cron Run: 无 announce 语义，每次触发均为独立 trace
+        traceId = randomUUID();
+        runType = "cron";
     } else {
         // Announce 或其他非用户发起的 Run: 继承 session 已有的 trace_id
         const existing = sessionTraceMap.get(sessionKey);

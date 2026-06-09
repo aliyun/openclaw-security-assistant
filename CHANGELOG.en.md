@@ -4,6 +4,12 @@ This file documents all notable changes to the `@alicloud/openclaw-security-assi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v1.4.2] - 2026-06-09
+
+### Fixed
+1. Fixed Cron tasks reusing the same trace_id across executions; each trigger now generates an independent trace_id
+2. Fixed Gateway chat history loading delay caused by service startup when the plugin has not completed authorization
+
 ## [v1.4.1] - 2026-05-22
 
 ### Fixed
@@ -56,5 +62,6 @@ Initial v1.0.0 release with LLM and Tool Call request/response inspection and en
 [v1.1.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.1.0
 [v1.2.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.2.0
 [v1.3.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.3.0
+[v1.4.2]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.2
 [v1.4.1]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.1
 [v1.4.0]: https://github.com/aliyun/openclaw-security-assistant/tree/release/v1.4.0
