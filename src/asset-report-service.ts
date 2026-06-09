@@ -516,6 +516,7 @@ export function createAssetReportService(params: {
 
     let timer: NodeJS.Timeout | null = null;
     let cacheTimer: NodeJS.Timeout | null = null;
+    let stopped = false;
     let snapshot: AssetDataSnapshot = EMPTY_SNAPSHOT;
     let refreshing = false;
 
@@ -662,9 +663,7 @@ export function createAssetReportService(params: {
         }
     }
 
-    return {
-        id: "openclaw-security-assistant-asset-report",
-        start: async (ctx: OpenClawPluginServiceContext) => {
+    async function startImpl(): Promise<void> {
             // 等待 auth-service 就绪
             const waitIntervalMs = 10_000; // 10 秒检查一次
             const maxWaitMs = 300_000; // 最多等待 5 分钟
@@ -690,6 +689,8 @@ export function createAssetReportService(params: {
             await tryRefreshSnapshot();
             await reportOnce().catch(() => {});
 
+            if (stopped) return;
+
             // 定时刷新资产数据缓存（30 分钟）
             cacheTimer = setInterval(() => tryRefreshSnapshot(), CLI_CACHE_REFRESH_INTERVAL_MS);
             cacheTimer.unref?.();
@@ -704,8 +705,17 @@ export function createAssetReportService(params: {
                 timeoutMs,
                 cacheRefreshIntervalMs: CLI_CACHE_REFRESH_INTERVAL_MS,
             });
+    }
+
+    return {
+        id: "openclaw-security-assistant-asset-report",
+        // fire-and-forget：不阻塞 gateway sidecar 启动
+        start: () => {
+            stopped = false;
+            void startImpl();
         },
         stop: async (ctx: OpenClawPluginServiceContext) => {
+            stopped = true;
             if (cacheTimer) clearInterval(cacheTimer);
             cacheTimer = null;
             if (timer) clearInterval(timer);

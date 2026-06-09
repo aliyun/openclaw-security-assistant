@@ -337,10 +337,7 @@ export function createConfigSyncService(params: ConfigSyncServiceParams): OpenCl
         }
     }
 
-    return {
-        id: "openclaw-security-assistant-config-sync",
-        start: async (_ctx: OpenClawPluginServiceContext) => {
-            stopped = false;
+    async function startImpl(): Promise<void> {
             // 等待 auth-service 就绪
             const waitIntervalMs = 5_000;
             const maxWaitMs = 300_000; // 最多等待 5 分钟
@@ -362,6 +359,8 @@ export function createConfigSyncService(params: ConfigSyncServiceParams): OpenCl
                 await syncOnce().catch(() => {});
             }
 
+            if (stopped) return;
+
             // 如果 syncOnce 中已经根据远端配置创建了定时器，则不再重复创建
             if (!timer) {
                 timer = setInterval(() => syncOnce().catch(() => {}), currentIntervalMs);
@@ -373,6 +372,14 @@ export function createConfigSyncService(params: ConfigSyncServiceParams): OpenCl
                 timeoutMs,
                 protectServerAddr,
             });
+    }
+
+    return {
+        id: "openclaw-security-assistant-config-sync",
+        // fire-and-forget：不阻塞 gateway sidecar 启动
+        start: (_ctx: OpenClawPluginServiceContext) => {
+            stopped = false;
+            void startImpl();
         },
         stop: async (_ctx: OpenClawPluginServiceContext) => {
             stopped = true;

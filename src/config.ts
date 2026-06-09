@@ -4,7 +4,7 @@ import type { OpenClawPluginConfigSchema } from "openclaw/plugin-sdk";
 // SDK Version Constants
 // ============================================================================
 
-export const SDK_VERSION = "1.4.1";
+export const SDK_VERSION = "1.4.2";
 
 // ============================================================================
 // Plugin Configuration Types
