@@ -303,3 +303,19 @@ export function buildReportMeta(ctx: RunContext): ReportMeta {
         event_time: Date.now(),
     };
 }
+
+/**
+ * RunContext 缺失时的兜底 meta：使用占位信息确保安全检测不被跳过。
+ */
+export function buildOrphanMeta(): ReportMeta {
+    const orphanId = `orphan-${randomUUID()}`;
+    return {
+        session_id: "unknown",
+        trace_id: orphanId,
+        run_id: orphanId,
+        agent_id: "unknown",
+        channel_id: "unknown",
+        session_key: "unknown",
+        event_time: Date.now(),
+    };
+}
